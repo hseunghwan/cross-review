@@ -30,10 +30,10 @@ MR 보내기 전 로컬 워킹트리를 교차 검증하는 용도.
 
 ```bash
 # 클론
-git clone https://dev.synap.co.kr/kall/cross-review.git ~/.claude/skills/cross-review
+git clone https://github.com/hseunghwan/cross-review.git ~/.claude/skills/cross-review
 
 # 또는 다른 곳에 클론 후 심볼릭 링크
-git clone https://dev.synap.co.kr/kall/cross-review.git ~/src/cross-review
+git clone https://github.com/hseunghwan/cross-review.git ~/src/cross-review
 ln -s ~/src/cross-review ~/.claude/skills/cross-review
 ```
 
