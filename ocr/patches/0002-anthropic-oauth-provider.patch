@@ -1,0 +1,1632 @@
+Subject: anthropic-oauth provider — run engine mode on a Claude Code subscription
+
+Base: alibaba/open-code-review v1.13.8 (4236c87)
+Port of upstream PR #1670 "feat(llm): add Claude subscription OAuth provider"
+(https://github.com/alibaba/open-code-review/pull/1670, head 3724a85, unmerged).
+Taken as `git diff b842659 3724a85` (PR-only changes, upstream merges excluded)
+and applied to v1.13.8 without conflicts.
+
+Each LLM call becomes one `claude -p` run with Claude Code's tools disabled and
+a --json-schema decision envelope {content, tool_calls}; OCR keeps its own tool
+loop, grouping, rounds, filter and relocation. Drop this patch once #1670 lands.
+
+diff --git a/cmd/opencodereview/auth_cmd.go b/cmd/opencodereview/auth_cmd.go
+index 39571d4..e17d45a 100644
+--- a/cmd/opencodereview/auth_cmd.go
++++ b/cmd/opencodereview/auth_cmd.go
+@@ -3,16 +3,23 @@
+ 
+ package main
+ 
+-import "github.com/spf13/cobra"
++import (
++	"fmt"
++
++	"github.com/alibaba/open-code-review/internal/llm"
++	"github.com/spf13/cobra"
++)
+ 
+ var (
+ 	authLoginDevice    bool
+ 	authLoginNoBrowser bool
+ )
+ 
++var runOfficialAuth = llm.RunOAuthAuth
++
+ var authCmd = &cobra.Command{
+ 	Use:   "auth",
+-	Short: "Manage Sign in with ChatGPT authentication",
++	Short: "Manage Sign in with ChatGPT and Claude subscription authentication",
+ 	Args:  cobra.NoArgs,
+ 	RunE: func(cmd *cobra.Command, args []string) error {
+ 		return cmd.Help()
+@@ -21,9 +28,12 @@ var authCmd = &cobra.Command{
+ 
+ var authLoginCmd = &cobra.Command{
+ 	Use:   "login",
+-	Short: "Sign in with ChatGPT",
++	Short: "Sign in with ChatGPT or through the Claude Code CLI",
+ 	Args:  cobra.NoArgs,
+ 	RunE: func(cmd *cobra.Command, args []string) error {
++		if official, err := runOfficialProviderAuth(cmd, "login"); official {
++			return err
++		}
+ 		if err := validateAuthProvider(); err != nil {
+ 			return err
+ 		}
+@@ -33,9 +43,12 @@ var authLoginCmd = &cobra.Command{
+ 
+ var authStatusCmd = &cobra.Command{
+ 	Use:   "status",
+-	Short: "Show saved ChatGPT registrations and authentication status",
++	Short: "Show saved ChatGPT registrations or Claude Code login status",
+ 	Args:  cobra.NoArgs,
+ 	RunE: func(cmd *cobra.Command, args []string) error {
++		if official, err := runOfficialProviderAuth(cmd, "status"); official {
++			return err
++		}
+ 		if err := validateAuthProvider(); err != nil {
+ 			return err
+ 		}
+@@ -45,9 +58,12 @@ var authStatusCmd = &cobra.Command{
+ 
+ var authLogoutCmd = &cobra.Command{
+ 	Use:   "logout",
+-	Short: "Revoke the ChatGPT session and clear local tokens",
++	Short: "Revoke the ChatGPT session or log out of Claude Code",
+ 	Args:  cobra.NoArgs,
+ 	RunE: func(cmd *cobra.Command, args []string) error {
++		if official, err := runOfficialProviderAuth(cmd, "logout"); official {
++			return err
++		}
+ 		if err := validateAuthProvider(); err != nil {
+ 			return err
+ 		}
+@@ -55,6 +71,22 @@ var authLogoutCmd = &cobra.Command{
+ 	},
+ }
+ 
++// runOfficialProviderAuth hands anthropic-oauth to the Claude Code CLI, which
++// owns that credential store. The ChatGPT login and registration flags have
++// no meaning there, so they are rejected rather than ignored.
++func runOfficialProviderAuth(cmd *cobra.Command, action string) (bool, error) {
++	preset, ok := llm.LookupProvider(authProvider)
++	if !ok || !llm.IsOAuthProtocol(preset.Protocol) {
++		return false, nil
++	}
++	for _, name := range []string{"account", "new-account", "enable-plan", "no-browser", "device"} {
++		if flag := cmd.Flags().Lookup(name); flag != nil && flag.Changed {
++			return true, fmt.Errorf("--%s is not supported for --provider %s", name, authProvider)
++		}
++	}
++	return true, runOfficialAuth(cmd.Context(), authProvider, action, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr())
++}
++
+ func init() {
+ 	authLoginCmd.Flags().BoolVar(&authLoginDevice, "device", false, "unsupported in the ChatGPT preview; use the local browser loopback flow")
+ 	authLoginCmd.Flags().BoolVar(&authLoginNoBrowser, "no-browser", false, "print a one-time local URL instead of opening a browser")
+diff --git a/cmd/opencodereview/auth_cmd_test.go b/cmd/opencodereview/auth_cmd_test.go
+index a871f67..5cd8c26 100644
+--- a/cmd/opencodereview/auth_cmd_test.go
++++ b/cmd/opencodereview/auth_cmd_test.go
+@@ -12,6 +12,7 @@ import (
+ 
+ 	"github.com/alibaba/open-code-review/internal/chatgptauth"
+ 	"github.com/spf13/cobra"
++	"github.com/spf13/pflag"
+ )
+ 
+ func TestAuthDefaultsToChatGPT(t *testing.T) {
+@@ -56,6 +57,10 @@ func TestAuthRejectsUnsupportedProviderWithoutAccountFlags(t *testing.T) {
+ 	if err := validateAuthProvider(); err == nil || !strings.Contains(err.Error(), "expected chatgpt") {
+ 		t.Fatalf("validateAuthProvider = %v", err)
+ 	}
++	authProvider = "anthropic-oauth"
++	if err := validateAuthProvider(); err == nil || !strings.Contains(err.Error(), "official CLI") {
++		t.Fatalf("validateAuthProvider = %v", err)
++	}
+ }
+ 
+ func TestAuthLoginFlagsAreMutuallyExclusive(t *testing.T) {
+@@ -72,3 +77,62 @@ func TestAuthLoginFlagsAreMutuallyExclusive(t *testing.T) {
+ 		t.Errorf("Execute error = %v", err)
+ 	}
+ }
++
++// executeAuthCommand runs the global command tree and restores every auth
++// flag afterwards, because cobra keeps parsed values on the shared commands.
++func executeAuthCommand(t *testing.T, args ...string) error {
++	t.Helper()
++	rootCmd.SetArgs(args)
++	defer func() {
++		rootCmd.SetArgs(nil)
++		for _, flags := range []*pflag.FlagSet{authCmd.PersistentFlags(), authLoginCmd.Flags(), authStatusCmd.Flags(), authLogoutCmd.Flags()} {
++			flags.VisitAll(func(flag *pflag.Flag) {
++				_ = flag.Value.Set(flag.DefValue)
++				flag.Changed = false
++			})
++		}
++	}()
++	return rootCmd.Execute()
++}
++
++func TestAuthAnthropicOAuthUsesClaudeCode(t *testing.T) {
++	old := runOfficialAuth
++	t.Cleanup(func() { runOfficialAuth = old })
++	var got []string
++	runOfficialAuth = func(_ context.Context, provider, action string, _ io.Reader, _, _ io.Writer) error {
++		got = append(got, provider+" "+action)
++		return nil
++	}
++	for _, action := range []string{"login", "status", "logout"} {
++		if err := executeAuthCommand(t, "auth", action, "--provider", "anthropic-oauth"); err != nil {
++			t.Fatalf("%s: %v", action, err)
++		}
++	}
++	want := []string{"anthropic-oauth login", "anthropic-oauth status", "anthropic-oauth logout"}
++	if strings.Join(got, "\n") != strings.Join(want, "\n") {
++		t.Fatalf("official auth calls = %q, want %q", got, want)
++	}
++	if authProvider != "chatgpt" {
++		t.Fatalf("provider flag leaked between commands: %q", authProvider)
++	}
++}
++
++func TestAuthAnthropicOAuthRejectsChatGPTFlags(t *testing.T) {
++	old := runOfficialAuth
++	t.Cleanup(func() { runOfficialAuth = old })
++	runOfficialAuth = func(context.Context, string, string, io.Reader, io.Writer, io.Writer) error {
++		t.Fatal("Claude Code ran with a ChatGPT-only flag")
++		return nil
++	}
++	for _, args := range [][]string{
++		{"auth", "login", "--provider", "anthropic-oauth", "--enable-plan"},
++		{"auth", "login", "--provider", "anthropic-oauth", "--no-browser"},
++		{"auth", "login", "--provider", "anthropic-oauth", "--device"},
++		{"auth", "login", "--provider", "anthropic-oauth", "--new-account"},
++		{"auth", "status", "--provider", "anthropic-oauth", "--account", "oaiapp_one"},
++	} {
++		if err := executeAuthCommand(t, args...); err == nil || !strings.Contains(err.Error(), "is not supported for --provider anthropic-oauth") {
++			t.Fatalf("%v: error = %v", args, err)
++		}
++	}
++}
+diff --git a/cmd/opencodereview/chatgpt_auth.go b/cmd/opencodereview/chatgpt_auth.go
+index bb97545..fb0df30 100644
+--- a/cmd/opencodereview/chatgpt_auth.go
++++ b/cmd/opencodereview/chatgpt_auth.go
+@@ -26,10 +26,13 @@ var logoutChatGPT = func(ctx context.Context, store chatgptauth.Store, account s
+ }
+ 
+ func validateAuthProvider() error {
+-	if authProvider != "chatgpt" {
+-		return fmt.Errorf("unknown auth provider %q; expected chatgpt", authProvider)
++	if authProvider == "chatgpt" {
++		return nil
++	}
++	if preset, ok := llm.LookupProvider(authProvider); ok && llm.IsOAuthProtocol(preset.Protocol) {
++		return fmt.Errorf("auth provider %q is managed by its official CLI and has no saved ChatGPT registrations", authProvider)
+ 	}
+-	return nil
++	return fmt.Errorf("unknown auth provider %q; expected chatgpt or anthropic-oauth", authProvider)
+ }
+ func runChatGPTLogin(ctx context.Context, out io.Writer) error {
+ 	if authLoginDevice {
+@@ -104,7 +107,7 @@ func runChatGPTLogout(ctx context.Context, out io.Writer) error {
+ 	return err
+ }
+ func init() {
+-	authCmd.PersistentFlags().StringVar(&authProvider, "provider", "chatgpt", "authentication provider: chatgpt")
++	authCmd.PersistentFlags().StringVar(&authProvider, "provider", "chatgpt", "authentication provider: chatgpt or anthropic-oauth")
+ 	authCmd.PersistentFlags().StringVar(&authAccount, "account", "", "ChatGPT registration client ID (default: active account)")
+ 	authLoginCmd.Flags().BoolVar(&authEnablePlan, "enable-plan", false, "request consent for plan usage on a retained ChatGPT registration")
+ 	authLoginCmd.Flags().BoolVar(&authNewAccount, "new-account", false, "register a separate ChatGPT account or workspace")
+diff --git a/cmd/opencodereview/provider_cmd.go b/cmd/opencodereview/provider_cmd.go
+index 59f4670..1b35352 100644
+--- a/cmd/opencodereview/provider_cmd.go
++++ b/cmd/opencodereview/provider_cmd.go
+@@ -315,6 +315,9 @@ func applyOfficialProviderConfig(configPath string, cfg *Config, result provider
+ 
+ 	fmt.Printf("\nProvider set to: %s\n", result.provider)
+ 	fmt.Printf("Model: %s\n", model)
++	if llm.IsOAuthProtocol(preset.Protocol) {
++		fmt.Printf("Sign in with 'ocr auth login --provider %s' if you have not already signed in.\n", result.provider)
++	}
+ 
+ 	fmt.Println("\nTesting connection...")
+ 	if err := runLLMTestPath(configPath); err != nil {
+diff --git a/docs/research/claude-hermes-auth.md b/docs/research/claude-hermes-auth.md
+new file mode 100644
+index 0000000..b0e41b9
+--- /dev/null
++++ b/docs/research/claude-hermes-auth.md
+@@ -0,0 +1,33 @@
++# Claude subscription authentication in Hermes
++
++Checked on 2026-10-01 against first-party NousResearch and Anthropic documentation and source. No Hermes installation, user credential inspection, or live account request was performed for this research.
++
++## Finding
++
++The newly listed Hermes provider uses the official Claude Code executable for subscription authentication and inference. It does not implement its own subscription OAuth exchange followed by ordinary Client SDK requests. Its transport is a request-scoped CLI subprocess speaking `stream-json`; Hermes retains its agent loop. The plugin is maintained by NousResearch and marked official in the Hermes catalog, while its own name and documentation still say experimental. This catalog designation does not establish Anthropic certification. [Hermes catalog](https://hermes-agent.nousresearch.com/docs/plugins/claude-subscription-directsdk), [catalog manifest](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/claude-subscription-directsdk.yaml)
++
++## Exact implementation
++
++The catalog pins standalone repository `NousResearch/hermes-plugin-claude-subscription-directsdk` at `ef73726cfaf2fa0ee041e55572f406e2c24fed83`, version 0.3.0, requiring Hermes 0.21.4 or newer. The catalog lists it as added September 20 and re-pinned September 27, 2026. The pinned commit's GitHub API metadata gives committer time September 26, 2026, 20:18:11 UTC. [Catalog](https://hermes-agent.nousresearch.com/docs/plugins/claude-subscription-directsdk), [pinned commit metadata](https://api.github.com/repos/NousResearch/hermes-plugin-claude-subscription-directsdk/commits/ef73726cfaf2fa0ee041e55572f406e2c24fed83)
++
++In the pinned `directsdk.py`, line 542 constructs the native command and line 548 spawns it with stdin/stdout pipes. It uses print mode, streaming JSON input/output, one logical native turn, disabled native tools and setting sources, strict MCP configuration, denied native approvals, and disabled native session persistence. Private files carry the system prompt and validated generation fields. Earlier user frames have querying disabled and require zero-turn acknowledgments; the final frame queries. Returned tools are checked against Hermes' inventory. These are version-sensitive replay mechanisms, rather than a general public arbitrary-history SDK contract. [Pinned transport source](https://github.com/NousResearch/hermes-plugin-claude-subscription-directsdk/blob/ef73726cfaf2fa0ee041e55572f406e2c24fed83/directsdk.py#L542), [replay source](https://github.com/NousResearch/hermes-plugin-claude-subscription-directsdk/blob/ef73726cfaf2fa0ee041e55572f406e2c24fed83/directsdk.py#L581)
++
++The adapter also creates a loopback HTTP admission relay. Native Claude Code sends its own authenticated request through it; the relay forwards native authorization headers in memory, allows one Messages request, and rejects further attempts. The pinned relay can move a cache-control marker to a stable replay boundary. Therefore this is a CLI transport with a local HTTP relay, not a promise of unmodified request bodies or a plugin-owned OAuth client. [Pinned admission source](https://github.com/NousResearch/hermes-plugin-claude-subscription-directsdk/blob/ef73726cfaf2fa0ee041e55572f406e2c24fed83/admission.py#L122), [cache-boundary adjustment](https://github.com/NousResearch/hermes-plugin-claude-subscription-directsdk/blob/ef73726cfaf2fa0ee041e55572f406e2c24fed83/admission.py#L23)
++
++Core support landed separately through Hermes PR 117451 on September 20, 2026, at commit `118984d7a02f8a8baec11255002cbbab7c202e06`. The earlier provider PR 105863 was closed after extraction, not merged as an in-tree provider. [Core PR](https://github.com/NousResearch/hermes-agent/pull/117451), [original PR](https://github.com/NousResearch/hermes-agent/pull/105863)
++
++## Authentication ownership and earlier Hermes route
++
++The new plugin delegates login and status to Claude Code. `directsdk_setup.py` invokes its auth commands and obtains the account's model picker through initialization. The plugin documentation says it never opens, copies, or refreshes credential files; the CLI owns these. [Pinned setup source](https://github.com/NousResearch/hermes-plugin-claude-subscription-directsdk/blob/ef73726cfaf2fa0ee041e55572f406e2c24fed83/directsdk_setup.py#L53), [plugin README](https://github.com/NousResearch/hermes-plugin-claude-subscription-directsdk#login-and-select)
++
++Hermes also has a separate native Anthropic credential path. `agent/anthropic_credentials.py` resolves environment tokens, Hermes-owned grants, and borrowed Claude Code credentials, and implements refresh plus durable write-back. Its existence must not be confused with the new DirectSDK plugin's authentication ownership. This research does not establish Anthropic endorsement of that separate direct-token route. [Hermes credential source](https://github.com/NousResearch/hermes-agent/blob/main/agent/anthropic_credentials.py)
++
++## Anthropic support and remaining uncertainty
++
++Anthropic's help article is dated June 16, 2026. Its June 15 update pauses previously announced Agent SDK billing changes and says SDK, print-mode CLI, and third-party app usage continue to consume subscription limits. The article explicitly preserves the proposed monthly-credit details as historical material; those proposed credits must not be described as currently available. [Current plan article](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)
++
++Claude Code's authentication documentation supports subscription sign-in for Pro, Max, Team, and Enterprise accounts. Invited Team users sign in with their own claude.ai accounts. On Windows, the CLI manages its credential file under the user profile or chosen configuration directory. Account entitlement and administrator policy still control access. [Official authentication documentation](https://code.claude.com/docs/en/authentication)
++
++The current Agent SDK overview describes the SDK as a library that runs Claude Code, and recommends the CLI subprocess interface for other languages. The official Python SDK source confirms a subprocess with streaming JSON. However, the overview and quickstart still contain an approval condition for developers offering claude.ai login in products. This coexists with the help article's explicit acknowledgment of third-party subscription SDK usage. These sources do not resolve every redistribution or hosted-product case, nor establish blanket official support for extracting subscription tokens into the Go Client SDK. [SDK overview](https://code.claude.com/docs/en/agent-sdk/overview), [SDK quickstart](https://code.claude.com/docs/en/agent-sdk/quickstart), [official Python subprocess transport](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/transport/subprocess_cli.py)
++
++For this local OCR integration, the evidence supports keeping subscription sign-in, refresh, and provider requests inside the official Claude Code runtime. Direct Client SDK OAuth through the Anthropic Console is a different credential and billing route. This is an implementation inference from the inspected sources, not a claim of Anthropic certification of OCR.
+diff --git a/extensions/frontend/src/shared/__tests__/providers.test.ts b/extensions/frontend/src/shared/__tests__/providers.test.ts
+index 4a74bcb..78b543f 100644
+--- a/extensions/frontend/src/shared/__tests__/providers.test.ts
++++ b/extensions/frontend/src/shared/__tests__/providers.test.ts
+@@ -6,6 +6,15 @@ import { isPresetProvider, lookupPreset, mergeModelLists, PROVIDER_PRESETS, uses
+ import { buildOfficialSaveEntries, detectInitialTab, isConfigReady, isValidProviderName } from '../configUtils';
+ import { OcrConfig } from '../types';
+ 
++test('anthropic-oauth uses official ambient OAuth credentials', () => {
++  const preset = lookupPreset('anthropic-oauth')!;
++  expect(preset.ambientAuth).toBe(true);
++  expect(usesAmbientAuth(preset)).toBe(true);
++  expect(usesAmbientAuth(preset, 'anthropic-oauth')).toBe(true);
++  expect(usesAmbientAuth(preset, 'openai')).toBe(false);
++  expect(preset.envVar).toBe('');
++});
++
+ describe('generated provider presets', () => {
+   it.each(['my-gateway', 'mimo-v2.6-flash', 'foo.api_key'])('accepts provider name %s', (name) => {
+     expect(isValidProviderName(name)).toBe(true);
+diff --git a/extensions/frontend/src/shared/providers.generated.ts b/extensions/frontend/src/shared/providers.generated.ts
+index 0c906f0..58132be 100644
+--- a/extensions/frontend/src/shared/providers.generated.ts
++++ b/extensions/frontend/src/shared/providers.generated.ts
+@@ -23,6 +23,20 @@ export const PROVIDER_PRESETS: OcrProviderPreset[] = [
+       "claude-sonnet-4-6"
+     ]
+   },
++  {
++    "name": "anthropic-oauth",
++    "displayName": "Anthropic Claude (Subscription OAuth)",
++    "protocol": "anthropic-oauth",
++    "baseUrl": "",
++    "envVar": "",
++    "ambientAuth": true,
++    "models": [
++      "sonnet",
++      "opus",
++      "claude-opus-5-5",
++      "claude-sonnet-5-5"
++    ]
++  },
+   {
+     "name": "baidu-qianfan",
+     "displayName": "Baidu Qianfan API",
+diff --git a/extensions/frontend/src/shared/providers.ts b/extensions/frontend/src/shared/providers.ts
+index f39955e..f5e0160 100644
+--- a/extensions/frontend/src/shared/providers.ts
++++ b/extensions/frontend/src/shared/providers.ts
+@@ -9,7 +9,7 @@ export { PROVIDER_PRESETS };
+ export interface OcrProviderPreset {
+   name: string;
+   displayName: string;
+-  protocol: 'anthropic' | 'openai' | 'openai-responses' | 'anthropic-bedrock';
++  protocol: 'anthropic' | 'openai' | 'openai-responses' | 'anthropic-bedrock' | 'anthropic-oauth';
+   baseUrl: string;
+   authHeader?: string;
+   envVar: string;
+@@ -29,7 +29,7 @@ export function isPresetProvider(name: string): boolean {
+ 
+ export function usesAmbientAuth(preset: OcrProviderPreset, protocolOverride?: string): boolean {
+   const protocol = protocolOverride?.trim().toLowerCase();
+-  if (protocol) return protocol === 'anthropic-bedrock';
++  if (protocol) return ['anthropic-bedrock', 'anthropic-oauth'].includes(protocol);
+   return preset.protocol === 'anthropic-bedrock' || preset.ambientAuth === true;
+ }
+ 
+diff --git a/extensions/frontend/src/webview/views/ConfigView.tsx b/extensions/frontend/src/webview/views/ConfigView.tsx
+index c86860c..df7bcc6 100644
+--- a/extensions/frontend/src/webview/views/ConfigView.tsx
++++ b/extensions/frontend/src/webview/views/ConfigView.tsx
+@@ -334,7 +334,8 @@ function OfficialForm({ wide, config, connTest, onBack, onTest, onSave }: FormPr
+   const [providerName, setProviderName] = useState(initialProvider);
+   const preset = PROVIDER_PRESETS.find((p) => p.name === providerName) ?? PROVIDER_PRESETS[0];
+   const savedEntry = config?.providers[providerName];
+-  const ambientAuth = usesAmbientAuth(preset, savedEntry?.protocol);
++  const resolvedProtocol = savedEntry?.protocol?.trim().toLowerCase() || preset.protocol;
++  const ambientAuth = usesAmbientAuth(preset, resolvedProtocol);
+ 
+   const modelOptions = useMemo(
+     () => mergeModelLists(preset.models, savedEntry?.models ?? []),
+@@ -411,6 +412,11 @@ function OfficialForm({ wide, config, connTest, onBack, onTest, onSave }: FormPr
+         )}
+       </FormItem>
+ 
++      {resolvedProtocol === 'anthropic-oauth' && (
++        <FormItem label="OAuth sign-in" hint="Run ocr auth login --provider anthropic-oauth in a terminal on the machine running OCR.">
++          <span>Uses your local Claude Code CLI and Claude subscription login.</span>
++        </FormItem>
++      )}
+       {!ambientAuth && (
+         <FormItem
+           label={t('view.config.apiKey')}
+diff --git a/extensions/idea/src/main/kotlin/com/alibaba/opencodereview/idea/services/ProviderNames.generated.kt b/extensions/idea/src/main/kotlin/com/alibaba/opencodereview/idea/services/ProviderNames.generated.kt
+index f4c1ca1..a90e900 100644
+--- a/extensions/idea/src/main/kotlin/com/alibaba/opencodereview/idea/services/ProviderNames.generated.kt
++++ b/extensions/idea/src/main/kotlin/com/alibaba/opencodereview/idea/services/ProviderNames.generated.kt
+@@ -8,6 +8,7 @@ package com.alibaba.opencodereview.idea.services
+ 
+ internal fun generatedPresetProviderNames(): Set<String> = setOf(
+     "anthropic",
++    "anthropic-oauth",
+     "baidu-qianfan",
+     "bedrock",
+     "chatgpt",
+diff --git a/internal/llm/claude_client.go b/internal/llm/claude_client.go
+new file mode 100644
+index 0000000..7c50736
+--- /dev/null
++++ b/internal/llm/claude_client.go
+@@ -0,0 +1,250 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 alibaba/open-code-review Contributors
++
++package llm
++
++import (
++	"bytes"
++	"context"
++	"crypto/rand"
++	"encoding/json"
++	"fmt"
++	"io"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"time"
++	"unicode/utf8"
++)
++
++type ClaudeOAuthClient struct{ cfg ClientConfig }
++
++func NewClaudeOAuthClient(cfg ClientConfig) *ClaudeOAuthClient {
++	if cfg.Timeout <= 0 {
++		cfg.Timeout = 5 * time.Minute
++	}
++	return &ClaudeOAuthClient{cfg: cfg}
++}
++
++type claudeDecision struct {
++	Content   string `json:"content"`
++	ToolCalls []struct {
++		Name      string `json:"name"`
++		Arguments string `json:"arguments"`
++	} `json:"tool_calls"`
++}
++
++func claudeDecisionSchema(req ChatRequest) map[string]any {
++	properties := map[string]any{
++		"name":      map[string]any{"type": "string"},
++		"arguments": map[string]any{"type": "string"},
++	}
++	names := []string{}
++	if req.ToolChoice != "none" {
++		for _, tool := range req.Tools {
++			names = append(names, tool.Function.Name)
++		}
++	}
++	if len(names) > 0 {
++		properties["name"] = map[string]any{"type": "string", "enum": names}
++	}
++	calls := map[string]any{"type": "array", "items": map[string]any{
++		"type": "object", "properties": properties,
++		"required": []string{"name", "arguments"}, "additionalProperties": false,
++	}}
++	if len(names) == 0 {
++		calls["maxItems"] = 0
++	}
++	if req.ToolChoice == "required" {
++		calls["minItems"] = 1
++	}
++	content := map[string]any{"type": "string"}
++	if len(names) > 0 {
++		content["maxLength"] = claudeContentMaxLength
++	}
++	return map[string]any{"type": "object", "properties": map[string]any{
++		"content": content, "tool_calls": calls,
++	}, "required": []string{"content", "tool_calls"}, "additionalProperties": false}
++}
++
++const claudeOCRInstructions = `You are the assistant in the supplied OCR conversation. The input JSON contains the complete conversation history and the available OCR tool definitions. Follow its system instructions and answer the last user request.
++OCR owns tool execution. Return only the next assistant decision using the output schema. To call an OCR tool, add its name and arguments to tool_calls. Each arguments value must be a JSON object serialized as a string. Do not execute tools or invent their results. Previous assistant tool calls and tool messages in the input are conversation history. When no OCR tools are available, put the complete answer in content and return an empty tool_calls array. While OCR tools are available, content is a short status sentence at most; return substantive results through the appropriate tools, never as findings, file lists or summaries in content. When code_comment is available, submit every review finding with a separate code_comment call. When task_done is available, call it last, after all findings for the task have been submitted. Do not put the decision envelope itself inside content.`
++
++// Leave room for a status sentence while keeping review findings in tool calls.
++const claudeContentMaxLength = 400
++
++func (c *ClaudeOAuthClient) CompletionsWithCtx(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
++	if req.Temperature != nil {
++		return nil, fmt.Errorf("Claude Code does not support temperature overrides")
++	}
++	if req.ToolChoice != "" && req.ToolChoice != "auto" && req.ToolChoice != "none" && req.ToolChoice != "required" {
++		return nil, fmt.Errorf("unsupported Claude Code tool_choice %q", req.ToolChoice)
++	}
++	if req.ToolChoice == "required" && len(req.Tools) == 0 {
++		return nil, fmt.Errorf("Claude Code tool_choice required needs at least one tool")
++	}
++	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
++	defer cancel()
++	path, err := oauthExecutable()
++	if err != nil {
++		return nil, err
++	}
++	env := oauthEnvironment()
++	if err := claudeSubscriptionStatus(ctx, path, env); err != nil {
++		return nil, err
++	}
++	if req.MaxTokens > 0 {
++		for i := len(env) - 1; i >= 0; i-- {
++			key, _, _ := strings.Cut(env[i], "=")
++			if strings.EqualFold(key, "CLAUDE_CODE_MAX_OUTPUT_TOKENS") {
++				env = append(env[:i], env[i+1:]...)
++			}
++		}
++		env = append(env, "CLAUDE_CODE_MAX_OUTPUT_TOKENS="+strconv.Itoa(req.MaxTokens))
++	}
++	model := req.Model
++	if model == "" {
++		model = c.cfg.Model
++	}
++	replay := req
++	replay.Messages = nil
++	instructions := []string{}
++	for _, message := range req.Messages {
++		if message.Role == "system" || message.Role == "developer" {
++			instructions = append(instructions, message.ExtractText())
++		} else {
++			replay.Messages = append(replay.Messages, message)
++		}
++	}
++	instructions = append(instructions, claudeOCRInstructions)
++	if req.ToolChoice == "none" {
++		replay.Tools = nil
++	}
++	prompt, err := json.Marshal(replay)
++	if err != nil {
++		return nil, fmt.Errorf("encode Claude Code conversation: %w", err)
++	}
++	if len(prompt) > 10*1024*1024 {
++		return nil, fmt.Errorf("Claude Code conversation exceeds the CLI's 10 MiB stdin limit")
++	}
++	schema, err := json.Marshal(claudeDecisionSchema(req))
++	if err != nil {
++		return nil, err
++	}
++	dir, err := os.MkdirTemp("", "ocr-claude-")
++	if err != nil {
++		return nil, err
++	}
++	defer os.RemoveAll(dir)
++	systemPath := filepath.Join(dir, "system.txt")
++	if err := os.WriteFile(systemPath, []byte(strings.Join(instructions, "\n\n")), 0o600); err != nil {
++		return nil, err
++	}
++	// Structured decisions keep OCR's existing tool loop and replay format;
++	// Claude Code owns subscription authentication, refresh and inference.
++	args := []string{"-p", "--safe-mode", "--restricted", "--tools", "",
++		"--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`, "--no-chrome",
++		"--no-session-persistence", "--setting-sources", "", "--permission-mode", "dontAsk",
++		"--permission-prompts", "none", "--output-format", "json", "--system-prompt-file", systemPath,
++		"--json-schema", string(schema)}
++	if model != "" {
++		args = append(args, "--model", model)
++	}
++	cmd := exec.CommandContext(ctx, path, args...)
++	cmd.Env, cmd.Dir, cmd.Stdin, cmd.Stderr = env, dir, bytes.NewReader(prompt), io.Discard
++	output := &claudeOutputBuffer{}
++	cmd.Stdout = output
++	runErr := cmd.Run()
++	if ctx.Err() != nil {
++		return nil, ctx.Err()
++	}
++	var result struct {
++		Subtype          string          `json:"subtype"`
++		IsError          bool            `json:"is_error"`
++		Result           string          `json:"result"`
++		Errors           []string        `json:"errors"`
++		StructuredOutput json.RawMessage `json:"structured_output"`
++		Usage            struct {
++			Input      int64 `json:"input_tokens"`
++			Output     int64 `json:"output_tokens"`
++			CacheRead  int64 `json:"cache_read_input_tokens"`
++			CacheWrite int64 `json:"cache_creation_input_tokens"`
++		} `json:"usage"`
++	}
++	if err := json.Unmarshal(output.buffer.Bytes(), &result); err != nil {
++		if runErr != nil {
++			return nil, fmt.Errorf("Claude Code invocation failed (use a current CLI): %w", runErr)
++		}
++		return nil, fmt.Errorf("decode Claude Code result: %w", err)
++	}
++	if result.IsError || runErr != nil || result.Subtype != "success" {
++		return nil, fmt.Errorf("Claude Code %s: %s %s", result.Subtype, result.Result, strings.Join(result.Errors, "; "))
++	}
++	var decision claudeDecision
++	if len(result.StructuredOutput) == 0 || string(result.StructuredOutput) == "null" {
++		return nil, fmt.Errorf("Claude Code returned no structured assistant decision")
++	}
++	if err := json.Unmarshal(result.StructuredOutput, &decision); err != nil {
++		return nil, fmt.Errorf("decode Claude Code assistant decision: %w", err)
++	}
++	if len(req.Tools) > 0 && req.ToolChoice != "none" && utf8.RuneCountInString(decision.Content) > claudeContentMaxLength {
++		return nil, fmt.Errorf("Claude Code content exceeds %d characters while OCR tools are available; submit results through OCR tool calls", claudeContentMaxLength)
++	}
++	calls := []ToolCall{}
++	for _, call := range decision.ToolCalls {
++		known := false
++		for _, tool := range req.Tools {
++			if tool.Function.Name == call.Name {
++				known = true
++				break
++			}
++		}
++		var arguments map[string]any
++		if !known || req.ToolChoice == "none" || json.Unmarshal([]byte(call.Arguments), &arguments) != nil || arguments == nil {
++			return nil, fmt.Errorf("Claude Code requested an invalid or unavailable OCR tool")
++		}
++		calls = append(calls, ToolCall{ID: "ocr_claude_" + rand.Text(), Type: "function", Function: FunctionCall{Name: call.Name, Arguments: call.Arguments}})
++	}
++	finishReason := "stop"
++	if len(calls) > 0 {
++		finishReason = "tool_calls"
++	} else if req.ToolChoice == "required" {
++		return nil, fmt.Errorf("Claude Code did not invoke the required OCR tool")
++	} else if strings.TrimSpace(decision.Content) == "" {
++		return nil, fmt.Errorf("Claude Code completed without an assistant response")
++	}
++	u := result.Usage
++	usage := &UsageInfo{PromptTokens: u.Input + u.CacheRead + u.CacheWrite, CompletionTokens: u.Output, CacheReadTokens: u.CacheRead, CacheWriteTokens: u.CacheWrite}
++	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
++	return &ChatResponse{Model: model, Usage: usage, Choices: []Choice{{FinishReason: finishReason, Message: ResponseMessage{Role: "assistant", Content: &decision.Content, ToolCalls: calls}}}}, nil
++}
++
++func claudeSubscriptionStatus(ctx context.Context, path string, env []string) error {
++	cmd := exec.CommandContext(ctx, path, "auth", "status", "--json")
++	cmd.Env, cmd.Dir, cmd.Stderr = env, os.TempDir(), io.Discard
++	output := &claudeOutputBuffer{}
++	cmd.Stdout = output
++	err := cmd.Run()
++	if ctx.Err() != nil {
++		return ctx.Err()
++	}
++	var status struct {
++		LoggedIn   bool   `json:"loggedIn"`
++		AuthMethod string `json:"authMethod"`
++	}
++	if err != nil || json.Unmarshal(output.buffer.Bytes(), &status) != nil || !status.LoggedIn || status.AuthMethod != "claude.ai" {
++		return fmt.Errorf("Claude subscription login required; run 'ocr auth login --provider anthropic-oauth' (uses 'claude auth login --claudeai')")
++	}
++	return nil
++}
++
++type claudeOutputBuffer struct{ buffer bytes.Buffer }
++
++func (b *claudeOutputBuffer) Write(p []byte) (int, error) {
++	if b.buffer.Len()+len(p) > 32*1024*1024 {
++		return 0, fmt.Errorf("Claude Code output exceeds 32 MiB")
++	}
++	return b.buffer.Write(p)
++}
+diff --git a/internal/llm/claude_client_test.go b/internal/llm/claude_client_test.go
+new file mode 100644
+index 0000000..cbd0729
+--- /dev/null
++++ b/internal/llm/claude_client_test.go
+@@ -0,0 +1,402 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 alibaba/open-code-review Contributors
++
++package llm
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++)
++
++func fakeClaudeClient(mode string) {
++	for _, key := range claudeBlockedTestEnv {
++		if os.Getenv(key) != "" {
++			os.Exit(30)
++		}
++	}
++	if os.Args[1] == "auth" {
++		if mode == "claude-auth-oversized" {
++			if !writeClaudeTestPadding() {
++				return
++			}
++		}
++		if mode == "claude-auth-error" {
++			fmt.Fprintln(os.Stdout, "bad-json")
++			return
++		}
++		method := "claude.ai"
++		if mode == "claude-api-key" {
++			method = "api_key"
++		}
++		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"loggedIn": mode != "claude-signed-out", "authMethod": method})
++		return
++	}
++	flag := func(name string) (string, bool) {
++		for i, arg := range os.Args[1:] {
++			if arg == name && i+2 < len(os.Args) {
++				return os.Args[i+2], true
++			}
++		}
++		return "", false
++	}
++	for _, name := range []string{"--safe-mode", "--restricted", "--strict-mcp-config", "--no-session-persistence", "--no-chrome"} {
++		if !strings.Contains(strings.Join(os.Args, " "), name) {
++			os.Exit(31)
++		}
++	}
++	if tools, ok := flag("--tools"); !ok || tools != "" {
++		os.Exit(32)
++	}
++	if os.Getenv("CLAUDE_CODE_MAX_OUTPUT_TOKENS") != "2048" {
++		os.Exit(37)
++	}
++	systemPath, _ := flag("--system-prompt-file")
++	system, err := os.ReadFile(systemPath)
++	if err != nil || !bytes.Contains(system, []byte("Review code")) || !bytes.Contains(system, []byte(claudeOCRInstructions)) {
++		os.Exit(33)
++	}
++	prompt, _ := io.ReadAll(os.Stdin)
++	var request ChatRequest
++	if json.Unmarshal(prompt, &request) != nil || len(request.Messages) == 0 || request.Messages[0].Role != "user" {
++		os.Exit(34)
++	}
++	if mode == "claude-replay" && (!bytes.Contains(prompt, []byte("result-of-test-call")) || !bytes.Contains(prompt, []byte("tool_call_id"))) {
++		os.Exit(35)
++	}
++	if mode == "claude-none" && len(request.Tools) > 0 {
++		os.Exit(36)
++	}
++	var schema struct {
++		Properties map[string]struct {
++			MaxLength *int `json:"maxLength"`
++		} `json:"properties"`
++	}
++	schemaJSON, ok := flag("--json-schema")
++	if !ok || json.Unmarshal([]byte(schemaJSON), &schema) != nil {
++		os.Exit(38)
++	}
++	limit := schema.Properties["content"].MaxLength
++	if len(request.Tools) > 0 {
++		if limit == nil || *limit != 400 {
++			os.Exit(38)
++		}
++	} else if limit != nil {
++		os.Exit(38)
++	}
++	if mode == "claude-timeout" {
++		time.Sleep(time.Minute)
++		return
++	}
++	if mode == "claude-malformed" {
++		fmt.Fprintln(os.Stdout, "bad-json")
++		return
++	}
++	if mode == "claude-output-oversized" && !writeClaudeTestPadding() {
++		return
++	}
++	decision := map[string]any{"content": "review complete", "tool_calls": []any{}}
++	if mode == "claude-tool" || mode == "claude-unknown-tool" || mode == "claude-invalid-arguments" {
++		name, arguments := "search_code", `{"query":"auth"}`
++		if mode == "claude-unknown-tool" {
++			name = "unavailable"
++		}
++		if mode == "claude-invalid-arguments" {
++			arguments = "null"
++		}
++		decision["tool_calls"] = []any{map[string]any{"name": name, "arguments": arguments}}
++	}
++	if mode == "claude-empty" {
++		decision["content"] = ""
++	}
++	if mode == "claude-prose-findings" {
++		decision["content"] = strings.Repeat("review.go:10: high: Untrusted input reaches the database query without validation. Use a parameterized query to prevent injection.\n", 6)
++		decision["tool_calls"] = []any{map[string]any{"name": "task_done", "arguments": `{}`}}
++	}
++	if mode == "claude-decision" {
++		if json.Unmarshal([]byte(os.Getenv("OCR_TEST_CLAUDE_DECISION")), &decision) != nil {
++			os.Exit(39)
++		}
++	}
++	result := map[string]any{"subtype": "success", "is_error": false, "structured_output": decision, "usage": map[string]any{"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 3, "cache_creation_input_tokens": 2}}
++	if mode == "claude-missing-decision" {
++		delete(result, "structured_output")
++	}
++	if mode == "claude-cli-error" {
++		result["is_error"], result["subtype"], result["result"] = true, "error_during_execution", "test service error"
++	}
++	_ = json.NewEncoder(os.Stdout).Encode(result)
++	if mode == "claude-cli-error" {
++		os.Exit(1)
++	}
++}
++
++func writeClaudeTestPadding() bool {
++	padding := bytes.Repeat([]byte(" "), 1024*1024)
++	for range 33 {
++		if _, err := os.Stdout.Write(padding); err != nil {
++			return false
++		}
++	}
++	return true
++}
++
++func TestClaudeOutputBufferSubprocessLimit(t *testing.T) {
++	fakeOAuthExecutable(t, "claude-auth-oversized")
++	executable, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, executable, "auth", "status", "--json")
++	cmd.Env = oauthEnvironment()
++	output := &claudeOutputBuffer{}
++	cmd.Stdout, cmd.Stderr = output, io.Discard
++	if err := cmd.Run(); err == nil {
++		t.Fatalf("subprocess error = %v, retained %d bytes", err, output.buffer.Len())
++	}
++	if output.buffer.Len() > 32*1024*1024 {
++		t.Fatalf("retained %d bytes, limit is 32 MiB", output.buffer.Len())
++	}
++}
++
++func TestClaudeOutputBufferLimit(t *testing.T) {
++	output := &claudeOutputBuffer{}
++	padding := bytes.Repeat([]byte(" "), 32*1024*1024)
++	if n, err := output.Write(padding); err != nil || n != len(padding) {
++		t.Fatalf("write at limit = %d, %v", n, err)
++	}
++	if n, err := output.Write([]byte(" ")); n != 0 || err == nil || !strings.Contains(err.Error(), "output exceeds 32 MiB") {
++		t.Fatalf("write beyond limit = %d, %v", n, err)
++	}
++	if output.buffer.Len() != len(padding) {
++		t.Fatalf("retained %d bytes, want %d", output.buffer.Len(), len(padding))
++	}
++}
++
++var claudeBlockedTestEnv = []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_EXTRA_BODY", "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SIMPLE"}
++
++func claudeTestRequest() ChatRequest {
++	return ChatRequest{MaxTokens: 2048, Messages: []Message{{Role: "system", Content: "Review code"}, {Role: "user", Content: "Find bugs"}}, Tools: []ToolDef{{Function: FunctionDef{Name: "search_code", Parameters: map[string]any{"type": "object"}}}}}
++}
++
++func TestClaudeOAuthRoundTrip(t *testing.T) {
++	for _, mode := range []string{"claude-text", "claude-tool", "claude-replay", "claude-none"} {
++		t.Run(mode, func(t *testing.T) {
++			fakeOAuthExecutable(t, mode)
++			for _, key := range claudeBlockedTestEnv {
++				t.Setenv(key, "must-not-reach-Claude")
++			}
++			t.Setenv("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "9999")
++			req := claudeTestRequest()
++			if mode == "claude-tool" {
++				req.ToolChoice = "required"
++			}
++			if mode == "claude-none" {
++				req.ToolChoice = "none"
++			}
++			if mode == "claude-replay" {
++				req.Messages = append(req.Messages, Message{Role: "assistant", ToolCalls: []ToolCall{{ID: "previous-call", Type: "function", Function: FunctionCall{Name: "search_code", Arguments: `{}`}}}}, Message{Role: "tool", ToolCallID: "previous-call", Content: "result-of-test-call"})
++			}
++			client := NewLLMClient(ResolvedEndpoint{Protocol: ProtocolAnthropicOAuth, Model: "test-model"}, nil, nil)
++			if _, ok := client.(*ClaudeOAuthClient); !ok {
++				t.Fatalf("subscription provider selected %T", client)
++			}
++			resp, err := client.CompletionsWithCtx(context.Background(), req)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if mode == "claude-tool" {
++				calls := resp.ToolCalls()
++				if len(calls) != 1 || !strings.HasPrefix(calls[0].ID, "ocr_claude_") || calls[0].Function.Arguments != `{"query":"auth"}` {
++					t.Fatalf("unexpected tool calls: %+v", calls)
++				}
++			} else if resp.Content() != "review complete" || resp.Usage == nil || resp.Usage.TotalTokens != 20 || resp.Usage.CacheReadTokens != 3 || resp.Model != "test-model" {
++				t.Fatalf("unexpected response: %+v", resp)
++			}
++		})
++	}
++}
++
++func TestClaudeOAuthRejectsFindingsInContent(t *testing.T) {
++	fakeOAuthExecutable(t, "claude-prose-findings")
++	req := claudeTestRequest()
++	req.ToolChoice = "required"
++	req.Tools = []ToolDef{
++		{Function: FunctionDef{Name: "code_comment", Parameters: map[string]any{"type": "object"}}},
++		{Function: FunctionDef{Name: "task_done", Parameters: map[string]any{"type": "object"}}},
++	}
++	resp, err := NewClaudeOAuthClient(ClientConfig{}).CompletionsWithCtx(context.Background(), req)
++	if err == nil {
++		t.Fatalf("accepted prose findings with task_done: content length %d, tool calls %+v", len(resp.Content()), resp.ToolCalls())
++	}
++	if !strings.Contains(err.Error(), "content exceeds 400 characters") {
++		t.Fatalf("error = %v, want content length rejection", err)
++	}
++}
++
++func TestClaudeOAuthContentLimit(t *testing.T) {
++	for _, tc := range []struct {
++		name, content, toolChoice string
++		noTools, wantError        bool
++	}{
++		{name: "status at limit", content: strings.Repeat("a", 400)},
++		{name: "status over limit", content: strings.Repeat("a", 401), wantError: true},
++		{name: "unicode at limit", content: strings.Repeat("\U0001f50d", 400)},
++		{name: "unicode over limit", content: strings.Repeat("\U0001f50d", 401), wantError: true},
++		{name: "no tools", content: strings.Repeat("a", 2240), noTools: true},
++		{name: "tools disabled", content: strings.Repeat("a", 2240), toolChoice: "none"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			fakeOAuthExecutable(t, "claude-decision")
++			decision, err := json.Marshal(map[string]any{"content": tc.content, "tool_calls": []any{}})
++			if err != nil {
++				t.Fatal(err)
++			}
++			t.Setenv("OCR_TEST_CLAUDE_DECISION", string(decision))
++			req := claudeTestRequest()
++			req.ToolChoice = tc.toolChoice
++			if tc.noTools {
++				req.Tools = nil
++			}
++			resp, err := NewClaudeOAuthClient(ClientConfig{}).CompletionsWithCtx(context.Background(), req)
++			if tc.wantError {
++				if err == nil || !strings.Contains(err.Error(), "content exceeds 400 characters") {
++					t.Fatalf("error = %v, want content length rejection", err)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			if resp.Content() != tc.content {
++				t.Fatal("response content was altered")
++			}
++		})
++	}
++}
++
++func TestClaudeOAuthReviewToolCalls(t *testing.T) {
++	fakeOAuthExecutable(t, "claude-decision")
++	finding := strings.Repeat("Use a parameterized query to prevent injection. ", 50)
++	arguments, err := json.Marshal(map[string]any{"content": finding})
++	if err != nil {
++		t.Fatal(err)
++	}
++	decision, err := json.Marshal(map[string]any{"content": "Review complete.", "tool_calls": []any{
++		map[string]any{"name": "code_comment", "arguments": string(arguments)},
++		map[string]any{"name": "task_done", "arguments": `{}`},
++	}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("OCR_TEST_CLAUDE_DECISION", string(decision))
++	req := claudeTestRequest()
++	req.ToolChoice = "required"
++	req.Tools = []ToolDef{
++		{Function: FunctionDef{Name: "code_comment", Parameters: map[string]any{"type": "object"}}},
++		{Function: FunctionDef{Name: "task_done", Parameters: map[string]any{"type": "object"}}},
++	}
++	resp, err := NewClaudeOAuthClient(ClientConfig{}).CompletionsWithCtx(context.Background(), req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	calls := resp.ToolCalls()
++	if len(calls) != 2 || calls[0].Function.Name != "code_comment" || calls[0].Function.Arguments != string(arguments) || calls[1].Function.Name != "task_done" {
++		t.Fatalf("review tool calls were altered: %+v", calls)
++	}
++}
++
++func TestClaudeOAuthFailures(t *testing.T) {
++	for _, tc := range []struct{ mode, want string }{
++		{"claude-api-key", "subscription login required"}, {"claude-signed-out", "subscription login required"}, {"claude-auth-error", "subscription login required"},
++		{"claude-auth-oversized", "subscription login required"}, {"claude-output-oversized", "Claude Code invocation failed"},
++		{"claude-malformed", "decode Claude Code result"}, {"claude-cli-error", "test service error"}, {"claude-unknown-tool", "unavailable OCR tool"},
++		{"claude-invalid-arguments", "unavailable OCR tool"}, {"claude-empty", "without an assistant"}, {"claude-missing-decision", "no structured assistant"},
++	} {
++		t.Run(tc.mode, func(t *testing.T) {
++			fakeOAuthExecutable(t, tc.mode)
++			_, err := NewClaudeOAuthClient(ClientConfig{}).CompletionsWithCtx(context.Background(), claudeTestRequest())
++			if err == nil || !strings.Contains(err.Error(), tc.want) {
++				t.Fatalf("error = %v, want %s", err, tc.want)
++			}
++		})
++	}
++	for _, req := range []ChatRequest{{ToolChoice: "invalid"}, {ToolChoice: "required"}, {Temperature: new(float64)}} {
++		if _, err := NewClaudeOAuthClient(ClientConfig{}).CompletionsWithCtx(context.Background(), req); err == nil {
++			t.Fatal("unsupported request accepted")
++		}
++	}
++	fakeOAuthExecutable(t, "claude-text")
++	req := claudeTestRequest()
++	req.ToolChoice = "required"
++	if _, err := NewClaudeOAuthClient(ClientConfig{}).CompletionsWithCtx(context.Background(), req); err == nil || !strings.Contains(err.Error(), "required OCR tool") {
++		t.Fatalf("required tool error = %v", err)
++	}
++	req = claudeTestRequest()
++	req.Messages[1].Content = func() {}
++	if _, err := NewClaudeOAuthClient(ClientConfig{}).CompletionsWithCtx(context.Background(), req); err == nil || !strings.Contains(err.Error(), "encode Claude Code") {
++		t.Fatalf("invalid conversation error = %v", err)
++	}
++	t.Setenv("OCR_CLAUDE_PATH", filepath.Join(t.TempDir(), "missing"))
++	if _, err := NewClaudeOAuthClient(ClientConfig{}).CompletionsWithCtx(context.Background(), claudeTestRequest()); err == nil {
++		t.Fatal("missing executable accepted")
++	}
++}
++
++func TestClaudeOAuthCancellation(t *testing.T) {
++	fakeOAuthExecutable(t, "claude-timeout")
++	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
++	defer cancel()
++	_, err := NewClaudeOAuthClient(ClientConfig{}).CompletionsWithCtx(ctx, claudeTestRequest())
++	if !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatalf("error = %v", err)
++	}
++}
++
++func TestClaudeOAuthLiveRoundTrip(t *testing.T) {
++	if os.Getenv("OCR_TEST_LIVE_CLAUDE") != "1" {
++		t.Skip("set OCR_TEST_LIVE_CLAUDE=1 with an existing Claude subscription login")
++	}
++	client := NewClaudeOAuthClient(ClientConfig{Model: "sonnet", Timeout: 90 * time.Second})
++	req := ChatRequest{MaxTokens: 4096, ToolChoice: "required", Messages: []Message{
++		{Role: "system", Content: "This is a synthetic connection test. Call self_test once with message ping. After its result, answer exactly pong without another tool call."},
++		{Role: "user", Content: "Run the connection test."},
++	}, Tools: []ToolDef{{Type: "function", Function: FunctionDef{Name: "self_test", Description: "Returns pong to verify OCR tool replay", Parameters: map[string]any{
++		"type": "object", "properties": map[string]any{"message": map[string]any{"type": "string", "enum": []string{"ping"}}}, "required": []string{"message"},
++	}}}}}
++	resp, err := client.CompletionsWithCtx(context.Background(), req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	calls := resp.ToolCalls()
++	if len(calls) != 1 || calls[0].Function.Name != "self_test" {
++		t.Fatalf("expected one self_test call, received %d calls", len(calls))
++	}
++	var args struct {
++		Message string `json:"message"`
++	}
++	if json.Unmarshal([]byte(calls[0].Function.Arguments), &args) != nil || args.Message != "ping" {
++		t.Fatal("self_test did not receive ping")
++	}
++	req.Messages = append(req.Messages, NewToolCallMessage(resp.VisibleContent(), calls, resp.Native(), ""), Message{Role: "tool", ToolCallID: calls[0].ID, Content: "pong"})
++	req.ToolChoice = "none"
++	resp, err = client.CompletionsWithCtx(context.Background(), req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if strings.TrimSpace(resp.Content()) != "pong" || len(resp.ToolCalls()) != 0 || resp.Usage == nil || resp.Usage.TotalTokens == 0 {
++		t.Fatal("subscription inference did not complete the OCR tool round trip")
++	}
++	t.Log("Claude subscription inference and OCR tool replay succeeded")
++}
+diff --git a/internal/llm/client.go b/internal/llm/client.go
+index dda5833..1346985 100644
+--- a/internal/llm/client.go
++++ b/internal/llm/client.go
+@@ -503,6 +503,8 @@ func NewLLMClient(ep ResolvedEndpoint, collector *RetryCollector, raw *RawHolder
+ 		AWSRegion:             ep.AWSRegion,
+ 	}
+ 	switch ep.Protocol {
++	case ProtocolAnthropicOAuth:
++		return NewClaudeOAuthClient(cfg)
+ 	case ProtocolAnthropic:
+ 		return NewAnthropicClient(cfg)
+ 	case ProtocolAnthropicBedrock:
+diff --git a/internal/llm/oauth.go b/internal/llm/oauth.go
+new file mode 100644
+index 0000000..a070770
+--- /dev/null
++++ b/internal/llm/oauth.go
+@@ -0,0 +1,70 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 alibaba/open-code-review Contributors
++
++package llm
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++)
++
++func oauthExecutable() (string, error) {
++	name, env := "claude", "OCR_CLAUDE_PATH"
++	if path := strings.TrimSpace(os.Getenv(env)); path != "" {
++		name = path
++	}
++	path, err := exec.LookPath(name)
++	if err != nil {
++		return "", fmt.Errorf("official %s executable not found; install it or set %s", name, env)
++	}
++	return filepath.Abs(path)
++}
++
++func oauthEnvironment() []string {
++	blocked := map[string]bool{
++		"ANTHROPIC_API_KEY": true, "ANTHROPIC_AUTH_TOKEN": true,
++		"ANTHROPIC_BASE_URL": true, "CLAUDE_CODE_OAUTH_TOKEN": true,
++		"ANTHROPIC_CUSTOM_HEADERS": true, "CLAUDE_CODE_EXTRA_BODY": true,
++		"CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR": true, "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": true,
++		"CLAUDE_CODE_USE_BEDROCK": true, "CLAUDE_CODE_USE_VERTEX": true,
++		"CLAUDE_CODE_USE_FOUNDRY": true, "CLAUDE_CODE_SIMPLE": true,
++	}
++	var env []string
++	for _, entry := range os.Environ() {
++		key, _, _ := strings.Cut(entry, "=")
++		if !blocked[strings.ToUpper(key)] {
++			env = append(env, entry)
++		}
++	}
++	return env
++}
++
++func RunOAuthAuth(ctx context.Context, provider, action string, stdin io.Reader, stdout, stderr io.Writer) error {
++	preset, ok := LookupProvider(provider)
++	if !ok || !IsOAuthProtocol(preset.Protocol) {
++		return fmt.Errorf("OAuth authentication supports anthropic-oauth")
++	}
++	if action != "login" && action != "status" && action != "logout" {
++		return fmt.Errorf("unsupported OAuth action %q", action)
++	}
++	path, err := oauthExecutable()
++	if err != nil {
++		return err
++	}
++	args := []string{"auth", action}
++	if action == "login" {
++		args = append(args, "--claudeai")
++	}
++	cmd := exec.CommandContext(ctx, path, args...)
++	cmd.Env = oauthEnvironment()
++	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
++	if err := cmd.Run(); err != nil {
++		return fmt.Errorf("%s %s: %w", provider, action, err)
++	}
++	return nil
++}
+diff --git a/internal/llm/oauth_test.go b/internal/llm/oauth_test.go
+new file mode 100644
+index 0000000..c3c1fa8
+--- /dev/null
++++ b/internal/llm/oauth_test.go
+@@ -0,0 +1,124 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 alibaba/open-code-review Contributors
++
++package llm
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func init() {
++	if mode := os.Getenv("OCR_TEST_OAUTH_CHILD"); mode != "" {
++		if mode == "auth" {
++			_ = json.NewEncoder(os.Stdout).Encode(os.Args[1:])
++			os.Exit(0)
++		}
++		if strings.HasPrefix(mode, "claude-") {
++			fakeClaudeClient(mode)
++			os.Exit(0)
++		}
++		os.Exit(2)
++	}
++}
++
++func fakeOAuthExecutable(t *testing.T, mode string) {
++	t.Helper()
++	executable, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("OCR_CLAUDE_PATH", executable)
++	t.Setenv("OCR_TEST_OAUTH_CHILD", mode)
++}
++
++func TestOfficialAuthCommands(t *testing.T) {
++	fakeOAuthExecutable(t, "auth")
++	for action, flag := range map[string]string{"login": "--claudeai", "status": "status", "logout": "logout"} {
++		var output bytes.Buffer
++		if err := RunOAuthAuth(context.Background(), ProtocolAnthropicOAuth, action, nil, &output, io.Discard); err != nil {
++			t.Fatal(err)
++		}
++		if !strings.Contains(output.String(), flag) {
++			t.Fatalf("args = %s, want %s", output.String(), flag)
++		}
++	}
++	for _, tc := range []struct{ provider, action string }{{"openai", "login"}, {ProtocolAnthropicOAuth, "invalid"}} {
++		if RunOAuthAuth(context.Background(), tc.provider, tc.action, nil, io.Discard, io.Discard) == nil {
++			t.Fatalf("invalid auth command succeeded: %+v", tc)
++		}
++	}
++	t.Setenv("OCR_CLAUDE_PATH", filepath.Join(t.TempDir(), "missing"))
++	if RunOAuthAuth(context.Background(), ProtocolAnthropicOAuth, "login", nil, io.Discard, io.Discard) == nil {
++		t.Fatal("missing executable accepted")
++	}
++}
++
++func TestAnthropicOAuthUsesSubscriptionLogin(t *testing.T) {
++	fakeOAuthExecutable(t, "auth")
++	t.Setenv("OCR_ANT_PATH", filepath.Join(t.TempDir(), "must-not-use-console"))
++	var output bytes.Buffer
++	if err := RunOAuthAuth(context.Background(), ProtocolAnthropicOAuth, "login", nil, &output, io.Discard); err != nil {
++		t.Fatal(err)
++	}
++	var args []string
++	if err := json.Unmarshal(output.Bytes(), &args); err != nil {
++		t.Fatal(err)
++	}
++	if strings.Join(args, " ") != "auth login --claudeai" {
++		t.Fatalf("subscription login args = %v", args)
++	}
++}
++
++func TestOAuthProviderResolution(t *testing.T) {
++	name := ProtocolAnthropicOAuth
++	path := writeConfig(t, map[string]any{"provider": name, "model": "account-specific-model", "providers": map[string]any{name: map[string]any{}}})
++	ep, err := ResolveEndpoint(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !ep.AmbientAuth || ep.Token != "" || ep.Protocol != name {
++		t.Fatalf("endpoint = %+v", ep)
++	}
++	for _, field := range []string{"api_key", "api_key_cmd", "url", "auth_header"} {
++		path := writeConfig(t, map[string]any{"provider": name, "model": "test", "providers": map[string]any{name: map[string]any{field: "must-not-be-used"}}})
++		if _, err := ResolveEndpoint(path); err == nil || !strings.Contains(err.Error(), "official OAuth credentials") {
++			t.Fatalf("%s: error = %v", field, err)
++		}
++	}
++	t.Setenv("OCR_LLM_EXTRA_HEADERS", "Authorization=Bearer must-not-be-used")
++	for _, opts := range []ResolveOptions{{}, {Provider: name}} {
++		if _, err := ResolveEndpointWithOptions(path, opts); err == nil || !strings.Contains(err.Error(), "OCR_LLM_EXTRA_HEADERS") {
++			t.Fatalf("global OAuth header override error = %v", err)
++		}
++	}
++}
++
++func TestOAuthRelativeExecutableRoundTrip(t *testing.T) {
++	fakeOAuthExecutable(t, "claude-text")
++	executable, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	dir := t.TempDir()
++	t.Chdir(dir)
++	relative, err := filepath.Rel(dir, executable)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("OCR_CLAUDE_PATH", relative)
++	client := NewLLMClient(ResolvedEndpoint{Protocol: ProtocolAnthropicOAuth, Model: "test-model"}, nil, nil)
++	response, err := client.CompletionsWithCtx(context.Background(), claudeTestRequest())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if response.Content() != "review complete" {
++		t.Fatalf("unexpected response: %q", response.Content())
++	}
++}
+diff --git a/internal/llm/protocol.go b/internal/llm/protocol.go
+index 04250e9..c95d9b9 100644
+--- a/internal/llm/protocol.go
++++ b/internal/llm/protocol.go
+@@ -35,6 +35,7 @@ const (
+ 	// official SDK's bedrock middleware performs that rewriting, so this
+ 	// shares the Anthropic client rather than reimplementing the protocol.
+ 	ProtocolAnthropicBedrock = "anthropic-bedrock"
++	ProtocolAnthropicOAuth   = "anthropic-oauth"
+ )
+ 
+ // NormalizeProtocol canonicalizes protocol names. It is case-insensitive and
+@@ -55,18 +56,28 @@ func NormalizeProtocol(raw string) string {
+ 		return ProtocolOpenAIResponses
+ 	case ProtocolAnthropicBedrock:
+ 		return ProtocolAnthropicBedrock
++	case ProtocolAnthropicOAuth:
++		return ProtocolAnthropicOAuth
+ 	default:
+ 		return normalized
+ 	}
+ }
+ 
+-// ValidateProtocol accepts the four canonical protocol names and rejects
++// ValidateProtocol accepts the canonical protocol names and rejects
+ // everything else.
+ func ValidateProtocol(p string) error {
+ 	switch p {
+-	case ProtocolAnthropic, ProtocolOpenAIChatCompletions, ProtocolOpenAIResponses, ProtocolAnthropicBedrock:
++	case ProtocolAnthropic, ProtocolOpenAIChatCompletions, ProtocolOpenAIResponses, ProtocolAnthropicBedrock, ProtocolAnthropicOAuth:
+ 		return nil
+ 	default:
+-		return fmt.Errorf("unsupported protocol %q; supported protocols are %q, %q, %q, %q", p, ProtocolAnthropic, ProtocolOpenAIChatCompletions, ProtocolOpenAIResponses, ProtocolAnthropicBedrock)
++		return fmt.Errorf("unsupported protocol %q; supported protocols are %q, %q, %q, %q, %q", p, ProtocolAnthropic, ProtocolOpenAIChatCompletions, ProtocolOpenAIResponses, ProtocolAnthropicBedrock, ProtocolAnthropicOAuth)
+ 	}
+ }
++
++func IsOAuthProtocol(protocol string) bool {
++	return protocol == ProtocolAnthropicOAuth
++}
++
++func usesAmbientAuth(protocol string) bool {
++	return protocol == ProtocolAnthropicBedrock || IsOAuthProtocol(protocol)
++}
+diff --git a/internal/llm/protocol_test.go b/internal/llm/protocol_test.go
+index 3383659..8d6fb7f 100644
+--- a/internal/llm/protocol_test.go
++++ b/internal/llm/protocol_test.go
+@@ -18,8 +18,10 @@ func TestNormalizeProtocol(t *testing.T) {
+ 		{"canonical anthropic is idempotent", ProtocolAnthropic, ProtocolAnthropic},
+ 		{"canonical openai is idempotent", ProtocolOpenAIChatCompletions, ProtocolOpenAIChatCompletions},
+ 		{"canonical openai-responses is idempotent", ProtocolOpenAIResponses, ProtocolOpenAIResponses},
++		{"canonical anthropic OAuth is idempotent", ProtocolAnthropicOAuth, ProtocolAnthropicOAuth},
+ 		{"anthropic case-insensitive", "ANTHROPIC", ProtocolAnthropic},
+ 		{"openai-responses case-insensitive", "OpenAI-Responses", ProtocolOpenAIResponses},
++		{"anthropic OAuth case-insensitive", "Anthropic-OAuth", ProtocolAnthropicOAuth},
+ 		{"unknown passthrough lowercased", "gRPC", "grpc"},
+ 		{"unknown anthropic-vertex preserved", "anthropic-vertex", "anthropic-vertex"},
+ 	}
+diff --git a/internal/llm/providers.go b/internal/llm/providers.go
+index 95a3d0f..572aa6e 100644
+--- a/internal/llm/providers.go
++++ b/internal/llm/providers.go
+@@ -43,6 +43,13 @@ type Provider struct {
+ // After modifying the built-in provider registry, run `go generate ./internal/llm`
+ // and commit both generated catalogs. See the root AGENTS.md for paths and verification.
+ var registry = []Provider{
++	{
++		Name:        "anthropic-oauth",
++		DisplayName: "Anthropic Claude (Subscription OAuth)",
++		Protocol:    ProtocolAnthropicOAuth,
++		AmbientAuth: true,
++		Models:      []string{"sonnet", "opus", "claude-opus-5-5", "claude-sonnet-5-5"},
++	},
+ 	{
+ 		Name:        "anthropic",
+ 		DisplayName: "Anthropic Claude API",
+diff --git a/internal/llm/providers_test.go b/internal/llm/providers_test.go
+index 99a5067..0608070 100644
+--- a/internal/llm/providers_test.go
++++ b/internal/llm/providers_test.go
+@@ -4,6 +4,7 @@
+ package llm
+ 
+ import (
++	"slices"
+ 	"sort"
+ 	"strings"
+ 	"testing"
+@@ -111,7 +112,7 @@ func TestListProviders_Order(t *testing.T) {
+ 	if len(providers) < 3 {
+ 		t.Fatalf("expected at least 3 providers, got %d", len(providers))
+ 	}
+-	expected := []string{"anthropic", "baidu-qianfan", "bedrock", "chatgpt", "dashscope", "dashscope-tokenplan", "deepseek", "edenai", "gemini", "hy-tokenplan", "iflytek", "kimi", "kimi-global", "litellm", "mimo", "minimax", "minimax-cn", "mistral", "novita", "ollama-cloud", "openai", "openai-responses", "openrouter", "siliconflow", "siliconflow-cn", "tencent-tokenhub", "volcengine", "xai", "z-ai", "z-ai-coding"}
++	expected := []string{"anthropic", "anthropic-oauth", "baidu-qianfan", "bedrock", "chatgpt", "dashscope", "dashscope-tokenplan", "deepseek", "edenai", "gemini", "hy-tokenplan", "iflytek", "kimi", "kimi-global", "litellm", "mimo", "minimax", "minimax-cn", "mistral", "novita", "ollama-cloud", "openai", "openai-responses", "openrouter", "siliconflow", "siliconflow-cn", "tencent-tokenhub", "volcengine", "xai", "z-ai", "z-ai-coding"}
+ 	if len(providers) != len(expected) {
+ 		t.Fatalf("expected %d providers, got %d", len(expected), len(providers))
+ 	}
+@@ -484,3 +485,20 @@ func TestProviders_AllProtocolsCanonical(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestLookupProvider_AnthropicOAuthDetails(t *testing.T) {
++	provider, ok := LookupProvider(ProtocolAnthropicOAuth)
++	if !ok {
++		t.Fatalf("provider %q was not found", ProtocolAnthropicOAuth)
++	}
++	models := []string{"sonnet", "opus", "claude-opus-5-5", "claude-sonnet-5-5"}
++	if provider.Protocol != ProtocolAnthropicOAuth || !provider.AmbientAuth || provider.BaseURL != "" || provider.EnvVar != "" || !slices.Equal(provider.Models, models) {
++		t.Fatalf("unexpected OAuth provider: %+v", provider)
++	}
++	for _, model := range provider.Models {
++		client := NewLLMClient(ResolvedEndpoint{Protocol: provider.Protocol, Model: model, AmbientAuth: provider.AmbientAuth}, nil, nil)
++		if _, ok := client.(*ClaudeOAuthClient); !ok {
++			t.Fatalf("model %q selected %T", model, client)
++		}
++	}
++}
+diff --git a/internal/llm/resolver.go b/internal/llm/resolver.go
+index 3399107..7cbaf91 100644
+--- a/internal/llm/resolver.go
++++ b/internal/llm/resolver.go
+@@ -127,6 +127,9 @@ func ResolveEndpointWithOptions(configPath string, opts ResolveOptions) (Resolve
+ 			}
+ 			return ResolvedEndpoint{}, fmt.Errorf("resolve OCR config file: provider %q is not configured in %s section because the config file does not exist", opts.Provider, section)
+ 		}
++		if IsOAuthProtocol(ep.Protocol) && len(env.headers) > 0 {
++			return ResolvedEndpoint{}, fmt.Errorf("OCR_LLM_EXTRA_HEADERS cannot override official OAuth authentication")
++		}
+ 		return finalizeResolvedEndpoint("OCR config file", ep, env), nil
+ 	}
+ 
+@@ -149,6 +152,9 @@ func ResolveEndpointWithOptions(configPath string, opts ResolveOptions) (Resolve
+ 		// transport supplies both. Everything else still needs all three.
+ 		complete := ep.Model != "" && (ep.AmbientAuth || (ep.URL != "" && ep.Token != ""))
+ 		if ok && complete {
++			if IsOAuthProtocol(ep.Protocol) && len(env.headers) > 0 {
++				return ResolvedEndpoint{}, fmt.Errorf("OCR_LLM_EXTRA_HEADERS cannot override official OAuth authentication")
++			}
+ 			return finalizeResolvedEndpoint(strategy.name, ep, env), nil
+ 		}
+ 	}
+@@ -297,6 +303,9 @@ func tryOCREnv(modelOverride string) (ResolvedEndpoint, bool, error) {
+ 		if protocol == ProtocolAnthropicBedrock {
+ 			return ResolvedEndpoint{}, false, fmt.Errorf("OCR environment: %w", errBedrockNotConfigurable(envOCRLLMProtocol))
+ 		}
++		if IsOAuthProtocol(protocol) {
++			return ResolvedEndpoint{}, false, fmt.Errorf("OCR environment: OAuth requires a configured provider; set provider to %q", protocol)
++		}
+ 	}
+ 	if protocol == "" {
+ 		useAnthropic := true // default true
+@@ -496,7 +505,7 @@ func tryProviderConfig(cfg configFile, modelOverride string, callerContext conte
+ 		if err := ValidateProtocol(normalized); err != nil {
+ 			return ResolvedEndpoint{}, false, fmt.Errorf("custom provider %q: %w", cfg.Provider, err)
+ 		}
+-		if normalized != ProtocolAnthropicBedrock && entry.URL == "" {
++		if !usesAmbientAuth(normalized) && entry.URL == "" {
+ 			return ResolvedEndpoint{}, false, fmt.Errorf("custom provider %q requires a url field for protocol %q", cfg.Provider, normalized)
+ 		}
+ 		url = entry.URL
+@@ -510,8 +519,15 @@ func tryProviderConfig(cfg configFile, modelOverride string, callerContext conte
+ 	// SigV4 signing and needs a token like anything else. Conversely an entry
+ 	// that selects the bedrock protocol explicitly signs its requests whatever
+ 	// the preset says.
+-	ambientAuth := protocol == ProtocolAnthropicBedrock ||
++	ambientAuth := usesAmbientAuth(protocol) ||
+ 		(isPreset && preset.AmbientAuth && entry.Protocol == "")
++	if IsOAuthProtocol(protocol) {
++		if entry.APIKey != "" || entry.APIKeyCmd != "" || entry.URL != "" || entry.AuthHeader != "" || len(entry.ExtraHeaders) > 0 || len(entry.ExtraBody) > 0 || len(entry.RetryCodes) > 0 {
++			return ResolvedEndpoint{}, false, fmt.Errorf("provider %q uses official OAuth credentials; api_key, api_key_cmd, url, auth_header, extra_headers, extra_body and retry_codes overrides are not supported", cfg.Provider)
++		}
++		apiKey = ""
++		url = ""
++	}
+ 
+ 	// No credential at all is an error, and it is reported before api_key_cmd
+ 	// runs: only the command's *execution* is deferred, not the emptiness check.
+@@ -670,6 +686,9 @@ func tryLegacyLlmConfig(cfg configFile, modelOverride string) (ResolvedEndpoint,
+ 		if protocol == ProtocolAnthropicBedrock {
+ 			return ResolvedEndpoint{}, false, fmt.Errorf("OCR config file: %w", errBedrockNotConfigurable("llm.protocol"))
+ 		}
++		if IsOAuthProtocol(protocol) {
++			return ResolvedEndpoint{}, false, fmt.Errorf("OCR config file: OAuth requires a configured provider; set provider to %q", protocol)
++		}
+ 	}
+ 	if protocol == "" {
+ 		useAnthropic := true // default true
+diff --git a/internal/llm/resolver_test.go b/internal/llm/resolver_test.go
+index 555d541..2712209 100644
+--- a/internal/llm/resolver_test.go
++++ b/internal/llm/resolver_test.go
+@@ -1409,6 +1409,9 @@ func TestResolveEndpointWithModelOverride_AllBuiltInProvidersAcceptUnlistedModel
+ 	for _, provider := range ListProviders() {
+ 		t.Run(provider.Name, func(t *testing.T) {
+ 			entry := providerEntryConfig{APIKey: "test-key", AWSRegion: "us-west-2"}
++			if IsOAuthProtocol(provider.Protocol) {
++				entry = providerEntryConfig{}
++			}
+ 			var credentialCalls int
+ 			if provider.Name == "chatgpt" {
+ 				entry = providerEntryConfig{}
+diff --git a/pages/src/content/docs/en/cli-reference.md b/pages/src/content/docs/en/cli-reference.md
+index 06bc5e5..03a454b 100644
+--- a/pages/src/content/docs/en/cli-reference.md
++++ b/pages/src/content/docs/en/cli-reference.md
+@@ -626,6 +626,14 @@ ocr llm models
+ 
+ `ocr auth` accepts `--provider chatgpt` and `--account <client-id>`; `login` also accepts `--no-browser`, `--new-account` and `--enable-plan`. ChatGPT does not support `--device`. `--enable-plan` requests consent for a saved registration and cannot be combined with `--new-account`. The model list is account-specific; an explicit model is accepted even if the list omits it. This provider accepts `extra_body` only for `reasoning`, `text` and `prompt_cache_key`. See the [ChatGPT preview guide](../chatgpt-preview/) for account handling, permissions and restrictions.
+ 
++`--provider anthropic-oauth` delegates `login`, `status` and `logout` to the official Claude Code CLI, which owns the credential store. The ChatGPT flags (`--account`, `--new-account`, `--enable-plan`, `--no-browser` and `--device`) and `ocr auth select` do not apply to it. See [Claude subscription provider](../configuration/#claude-subscription-provider).
++
++```bash
++ocr auth login --provider anthropic-oauth
++ocr auth status --provider anthropic-oauth
++ocr auth logout --provider anthropic-oauth
++```
++
+ ## `ocr llm`
+ 
+ LLM utility commands. Three subcommands:
+diff --git a/pages/src/content/docs/en/configuration.md b/pages/src/content/docs/en/configuration.md
+index 2f74660..e55c49b 100644
+--- a/pages/src/content/docs/en/configuration.md
++++ b/pages/src/content/docs/en/configuration.md
+@@ -40,13 +40,16 @@ ocr config set providers.anthropic.api_key sk-ant-xxxxxxxxxx
+ The following providers ship with OCR, with the Base URL and protocol
+ preset. Most require an API key. If `providers.<name>.api_key` is unset,
+ OCR falls back to the corresponding environment variable. The `chatgpt`
+-provider instead uses the ChatGPT credentials created by `ocr auth login`.
++provider instead uses the ChatGPT credentials created by `ocr auth login`, and
++`anthropic-oauth` uses the Claude Code CLI login (see
++[Claude subscription provider](#claude-subscription-provider)).
+ 
+ | Name | Protocol | Base URL | API key env var |
+ |---|---|---|---|
+ | `anthropic` | anthropic | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
+ | `bedrock` | anthropic-bedrock | derived from `aws_region` | — (AWS credential chain) |
+ | `chatgpt` | openai-responses | `https://api.openai.com/v1` | not applicable (Sign in with ChatGPT) |
++| `anthropic-oauth` | anthropic-oauth | managed by Claude Code | Claude subscription OAuth |
+ | `openai` | openai | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+ | `openai-responses` | openai-responses | `https://api.openai.com/v1` | `OPENAI_RESPONSES_API_KEY` |
+ | `openrouter` | openai | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+@@ -108,7 +111,7 @@ The provider accepts explicit model values even if the account-specific catalog
+ 
+ ### Overriding a built-in provider's Base URL
+ 
+-Every built-in provider has a preset Base URL (shown in the table above).
++HTTP providers have a preset Base URL (shown in the table above).
+ To point a built-in provider at a different endpoint — for example a
+ self-hosted LiteLLM gateway that is rarely at the preset default
+ `http://localhost:4000/v1` — set `providers.<name>.url`:
+@@ -126,6 +129,66 @@ The configured `url` takes precedence over the preset Base URL. When
+ `providers.<name>.url` is unset (or cleared), OCR falls back to the
+ preset default — so you only need to set it when your endpoint differs.
+ 
++### Claude subscription provider
++
++The `anthropic-oauth` provider uses a Claude or Claude Code subscription
++through the official Claude Code CLI. Credentials stay in Claude Code's
++credential store: OCR saves only the provider and model selection, and Claude
++Code refreshes credentials. The provider picker skips API-key entry for this
++provider. Install the
++[official Claude Code CLI](https://code.claude.com/docs/en/setup), then run:
++
++```bash
++ocr auth login --provider anthropic-oauth
++ocr config set provider anthropic-oauth
++ocr config set providers.anthropic-oauth.model sonnet
++ocr llm test
++```
++
++`ocr auth` defaults to the `chatgpt` provider, so pass
++`--provider anthropic-oauth`. The ChatGPT flags `--account`, `--new-account`,
++`--enable-plan`, `--no-browser` and `--device` are rejected for this provider.
++Login delegates to `claude auth login --claudeai`; an existing Claude Code
++subscription login is reused. `OCR_CLAUDE_PATH` can select an absolute Claude
++executable path, and `CLAUDE_CONFIG_DIR` selects its configuration directory.
++API-key, static token, and third-party endpoint environment variables do not
++override this provider. Claude Code has no device login flag; follow the
++URL/code instructions from its normal login command when browser launch is
++unavailable.
++
++OCR uses the documented
++[print-mode subprocess interface](https://code.claude.com/docs/en/headless)
++and structured JSON output, tested with Claude Code 2.1.286. Each completion
++replays OCR's logical conversation as JSON into a fresh CLI process, with a
++private working directory and native tools, MCP servers, customizations, and
++session persistence disabled. The structured response declares OCR tool calls;
++OCR validates and executes them through its existing tool loop, then includes
++the results in the next completion. This adapter does not preserve native
++Claude thinking blocks or native cache boundaries. The CLI manages retries and
++its inference loop; OCR's HTTP middleware cannot capture this transport.
++`ChatRequest.MaxTokens` sets the documented `CLAUDE_CODE_MAX_OUTPUT_TOKENS`
++budget, subject to the CLI's model limits and structured-output retries;
++temperature overrides are rejected. The CLI stdin limit is 10 MiB.
++
++Anthropic's [current subscription guidance](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)
++says SDK, `claude -p`, and third-party app usage continue to draw from
++subscription limits. Account access and organization policy determine which
++models are available. Choose `sonnet`, `opus`, or an account-supported model ID.
++
++Use `ocr auth status --provider anthropic-oauth` and
++`ocr auth logout --provider anthropic-oauth` to inspect or clear the Claude Code
++login. These commands operate on Claude Code's selected credential store, which
++is shared with the CLI. Authentication status reports the local login; it is
++not a connectivity test. Use `ocr llm test` to verify inference. Login
++commands require user interaction; OCR never opens a login during a review.
++
++This provider requires provider configuration; `OCR_LLM_PROTOCOL` and the
++legacy `llm.protocol` URL/token path cannot select it. API-key, credential
++command, URL, authentication-header, extra-body/header, and retry-code
++overrides are rejected. The integration uses a local official CLI and
++interactive account login. Use API-key or federated providers when your
++deployment needs unattended service credentials.
++
+ ### AWS Bedrock
+ 
+ With its default `anthropic-bedrock` protocol, `bedrock` uses the same Messages API as `anthropic`, but requests are
+diff --git a/pages/src/content/docs/ja/configuration.md b/pages/src/content/docs/ja/configuration.md
+index 06758f8..dfcbbaa 100644
+--- a/pages/src/content/docs/ja/configuration.md
++++ b/pages/src/content/docs/ja/configuration.md
+@@ -46,6 +46,7 @@ ocr config set providers.anthropic.api_key sk-ant-xxxxxxxxxx
+ | `anthropic` | anthropic | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
+ | `bedrock` | anthropic-bedrock | `aws_region` から決定 | —（AWS 認証情報チェーン） |
+ | `chatgpt` | openai-responses | `https://api.openai.com/v1` | 該当なし（Sign in with ChatGPT） |
++| `anthropic-oauth` | anthropic-oauth | Claude Code が管理 | Claude サブスクリプション OAuth |
+ | `openai` | openai | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+ | `openai-responses` | openai-responses | `https://api.openai.com/v1` | `OPENAI_RESPONSES_API_KEY` |
+ | `openrouter` | openai | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+diff --git a/pages/src/content/docs/ko/configuration.md b/pages/src/content/docs/ko/configuration.md
+index 154f4f9..276b34f 100644
+--- a/pages/src/content/docs/ko/configuration.md
++++ b/pages/src/content/docs/ko/configuration.md
+@@ -43,6 +43,7 @@ ocr config set providers.anthropic.api_key sk-ant-xxxxxxxxxx
+ | `anthropic` | anthropic | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
+ | `bedrock` | anthropic-bedrock | `aws_region`에서 결정 | — (AWS 자격 증명 체인) |
+ | `chatgpt` | openai-responses | `https://api.openai.com/v1` | 해당 없음 (Sign in with ChatGPT) |
++| `anthropic-oauth` | anthropic-oauth | Claude Code에서 관리 | Claude 구독 OAuth |
+ | `openai` | openai | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+ | `openai-responses` | openai-responses | `https://api.openai.com/v1` | `OPENAI_RESPONSES_API_KEY` |
+ | `openrouter` | openai | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+diff --git a/pages/src/content/docs/ru/configuration.md b/pages/src/content/docs/ru/configuration.md
+index e0df485..14d38a6 100644
+--- a/pages/src/content/docs/ru/configuration.md
++++ b/pages/src/content/docs/ru/configuration.md
+@@ -51,6 +51,7 @@ ocr config set providers.anthropic.api_key sk-ant-xxxxxxxxxx
+ | `anthropic` | anthropic | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
+ | `bedrock` | anthropic-bedrock | определяется `aws_region` | — (цепочка учётных данных AWS) |
+ | `chatgpt` | openai-responses | `https://api.openai.com/v1` | не применяется (Sign in with ChatGPT) |
++| `anthropic-oauth` | anthropic-oauth | управляется Claude Code | OAuth подписки Claude |
+ | `openai` | openai | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+ | `openai-responses` | openai-responses | `https://api.openai.com/v1` | `OPENAI_RESPONSES_API_KEY` |
+ | `openrouter` | openai | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+diff --git a/pages/src/content/docs/zh/configuration.md b/pages/src/content/docs/zh/configuration.md
+index 440b585..a85d1e7 100644
+--- a/pages/src/content/docs/zh/configuration.md
++++ b/pages/src/content/docs/zh/configuration.md
+@@ -45,6 +45,7 @@ ocr config set providers.anthropic.api_key sk-ant-xxxxxxxxxx
+ | `anthropic` | anthropic | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
+ | `bedrock` | anthropic-bedrock | 由 `aws_region` 决定 | —（AWS 凭证链） |
+ | `chatgpt` | openai-responses | `https://api.openai.com/v1` | 不适用（Sign in with ChatGPT） |
++| `anthropic-oauth` | anthropic-oauth | 由 Claude Code 管理 | Claude 订阅 OAuth |
+ | `openai` | openai | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+ | `openai-responses` | openai-responses | `https://api.openai.com/v1` | `OPENAI_RESPONSES_API_KEY` |
+ | `openrouter` | openai | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
