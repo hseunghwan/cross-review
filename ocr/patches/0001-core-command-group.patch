@@ -1,0 +1,1680 @@
+Subject: ocr core — LLM-free building blocks for an external review brain
+
+Base: alibaba/open-code-review v1.13.8 (4236c87)
+Adds the `ocr core` command group (diff, relocate, emit, rule, prompt, template,
+tools, group, render). Every sub-command reuses engine internals so a host agent
+(Claude Code via the open-code-review-local skill) reaches the same file
+selection, grouping, prompts, line positions and output contract as `ocr review`.
+No sub-command makes an LLM or network call.
+
+Files: cmd/opencodereview/root.go (register), cmd/opencodereview/core_cmd*.go,
+       internal/agent/core*.go
+Reimplemented on v1.13.8 from the behaviour of the earlier v1.6.6+core build
+(original source not available). Upstream does not ship this command group.
+
+diff --git a/cmd/opencodereview/core_cmd.go b/cmd/opencodereview/core_cmd.go
+new file mode 100644
+index 0000000..2a4f8d9
+--- /dev/null
++++ b/cmd/opencodereview/core_cmd.go
+@@ -0,0 +1,752 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 alibaba/open-code-review Contributors
++
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"os"
++	"sort"
++	"strings"
++	"time"
++
++	"github.com/alibaba/open-code-review/internal/agent"
++	"github.com/alibaba/open-code-review/internal/config/template"
++	"github.com/alibaba/open-code-review/internal/diff"
++	"github.com/alibaba/open-code-review/internal/llm"
++	"github.com/alibaba/open-code-review/internal/model"
++	"github.com/alibaba/open-code-review/internal/stdout"
++	"github.com/alibaba/open-code-review/internal/tool"
++	"github.com/spf13/cobra"
++)
++
++// coreOutput is where core sub-commands write their JSON; tests swap it.
++var coreOutput io.Writer = os.Stdout
++
++// coreInput is where relocate and emit read their JSON; tests swap it.
++var coreInput io.Reader = os.Stdin
++
++type coreOptions struct {
++	repoDir       string
++	from          string
++	to            string
++	commit        string
++	rulePath      string
++	excludes      string
++	maxTokens     int
++	maxGitProcs   int
++	files         string
++	background    string
++	planFile      string
++	confirmedFile string
++	commentsFile  string
++	responseFile  string
++	date          string
++	effort        string
++}
++
++var coreDiffOpts, coreRuleOpts, coreGroupOpts, coreRenderOpts, coreTemplateOpts coreOptions
++
++var corePhases = []string{"main", "plan", "filter", "relocation", "grouping", "memory_compression"}
++
++var coreCmd = &cobra.Command{
++	Use:   "core",
++	Short: "LLM-free building blocks for an external review brain",
++	Long: `Deterministic, LLM-free building blocks for an external review brain.
++
++Each sub-command exposes one deterministic step of ` + "`ocr review`" + ` so a host
++agent can supply the reasoning while reaching the same file selection,
++grouping, prompts, line positions and output contract.
++
++Notes:
++  - No core sub-command makes an LLM or network call.
++  - Diff modes: workspace (default), --from/--to, or --commit.`,
++	Example: `  ocr core diff --from main --to feature
++  ocr core group --from main --to feature
++  ocr core render main --from main --to feature --files a.go,b.go
++  ocr core rule src/main/java/com/example/Foo.java
++  ocr core prompt main
++  ocr core template`,
++	Args: cobra.NoArgs,
++	RunE: func(cmd *cobra.Command, args []string) error { return cmd.Help() },
++}
++
++var coreDiffCmd = &cobra.Command{
++	Use:   "diff [flags]",
++	Short: "Output reviewable files, diff bodies, hunk maps and exclude reasons as JSON",
++	Args:  cobra.NoArgs,
++	RunE: func(cmd *cobra.Command, args []string) error {
++		defer stdout.Quiet()()
++		return runCoreDiff(coreDiffOpts)
++	},
++}
++
++var coreRelocateCmd = &cobra.Command{
++	Use:   "relocate",
++	Short: "Map a comment's existing_code to exact line numbers (reads stdin JSON)",
++	Args:  cobra.NoArgs,
++	RunE: func(cmd *cobra.Command, args []string) error {
++		defer stdout.Quiet()()
++		return runCoreRelocate(coreInput)
++	},
++}
++
++var coreEmitCmd = &cobra.Command{
++	Use:   "emit",
++	Short: "Wrap a comment array in the ocr review JSON contract (reads stdin JSON)",
++	Args:  cobra.NoArgs,
++	RunE: func(cmd *cobra.Command, args []string) error {
++		defer stdout.Quiet()()
++		return runCoreEmit(coreInput)
++	},
++}
++
++var coreRuleCmd = &cobra.Command{
++	Use:   "rule [flags] <file-path>",
++	Short: "Print the review rule that applies to a file path",
++	Args:  exactArgs(1),
++	RunE: func(cmd *cobra.Command, args []string) error {
++		defer stdout.Quiet()()
++		return runCoreRule(coreRuleOpts, args[0])
++	},
++}
++
++var corePromptCmd = &cobra.Command{
++	Use:   "prompt <" + strings.Join(corePhases, "|") + ">",
++	Short: "Print an embedded prompt phase as raw JSON messages",
++	Args:  exactArgs(1),
++	RunE: func(cmd *cobra.Command, args []string) error {
++		return runCorePrompt(args[0])
++	},
++}
++
++var coreToolsCmd = &cobra.Command{
++	Use:   "tools <main|plan|filter>",
++	Short: "Print the tool definitions a phase offers the model",
++	Args:  exactArgs(1),
++	RunE: func(cmd *cobra.Command, args []string) error {
++		return runCoreTools(args[0])
++	},
++}
++
++var coreTemplateCmd = &cobra.Command{
++	Use:   "template [flags]",
++	Short: "Print the pipeline thresholds and limits the review applies",
++	Args:  cobra.NoArgs,
++	RunE: func(cmd *cobra.Command, args []string) error {
++		return runCoreTemplate(coreTemplateOpts)
++	},
++}
++
++var coreGroupCmd = &cobra.Command{
++	Use:   "group [flags]",
++	Short: "Split the reviewable files into review groups (prompt or final groups)",
++	Long: `Splits the reviewable files into review groups the way ` + "`ocr review`" + ` does.
++
++When the change set is small the groups are computed directly. Otherwise the
++output carries the grouping prompt; answer it and pass the raw answer back with
++--response-file to receive the final groups.`,
++	Args: cobra.NoArgs,
++	RunE: func(cmd *cobra.Command, args []string) error {
++		defer stdout.Quiet()()
++		return runCoreGroup(coreGroupOpts)
++	},
++}
++
++var coreRenderCmd = &cobra.Command{
++	Use:   "render <main|plan|filter> [flags]",
++	Short: "Render a phase prompt for one review group with every placeholder filled",
++	Args:  exactArgs(1),
++	RunE: func(cmd *cobra.Command, args []string) error {
++		defer stdout.Quiet()()
++		return runCoreRender(coreRenderOpts, args[0])
++	},
++}
++
++func init() {
++	for _, c := range []*cobra.Command{coreDiffCmd, coreGroupCmd, coreRenderCmd} {
++		opts := coreOptsFor(c)
++		addRepoFlag(c, &opts.repoDir)
++		addDiffFlags(c, &opts.from, &opts.to, &opts.commit)
++		addRuleFlag(c, &opts.rulePath)
++		addExcludeFlag(c, &opts.excludes)
++		c.Flags().IntVar(&opts.maxTokens, "max-tokens", 0, "large-diff filter base (0 = use template MAX_TOKENS)")
++		c.Flags().IntVar(&opts.maxGitProcs, "max-git-procs", 16, "max concurrent git subprocesses")
++	}
++	addRepoFlag(coreRuleCmd, &coreRuleOpts.repoDir)
++	addRuleFlag(coreRuleCmd, &coreRuleOpts.rulePath)
++
++	coreGroupCmd.Flags().StringVar(&coreGroupOpts.responseFile, "response-file", "", "file holding the grouping model's raw answer")
++
++	f := coreRenderCmd.Flags()
++	f.StringVar(&coreRenderOpts.files, "files", "", "comma-separated paths of the review group (required)")
++	f.StringVarP(&coreRenderOpts.background, "background", "b", "", "optional requirement/business context")
++	f.StringVar(&coreRenderOpts.planFile, "plan-file", "", "main: file holding the plan phase answer (first round only)")
++	f.StringVar(&coreRenderOpts.confirmedFile, "confirmed-file", "", "main: JSON array of comments confirmed by earlier rounds")
++	f.StringVar(&coreRenderOpts.commentsFile, "comments-file", "", "filter: JSON array of this round's candidate comments")
++	f.StringVar(&coreRenderOpts.date, "date", "", "value for {{current_system_date_time}} (default: now, \"2006-01-02 15:04\")")
++
++	coreTemplateCmd.Flags().StringVar(&coreTemplateOpts.effort, "effort", "", "review effort preset: low | medium | high (default medium)")
++
++	coreCmd.AddCommand(coreDiffCmd, coreRelocateCmd, coreEmitCmd, coreRuleCmd, corePromptCmd,
++		coreToolsCmd, coreTemplateCmd, coreGroupCmd, coreRenderCmd)
++}
++
++func coreOptsFor(c *cobra.Command) *coreOptions {
++	switch c {
++	case coreGroupCmd:
++		return &coreGroupOpts
++	case coreRenderCmd:
++		return &coreRenderOpts
++	default:
++		return &coreDiffOpts
++	}
++}
++
++func writeCoreJSON(value any) error {
++	enc := json.NewEncoder(coreOutput)
++	enc.SetIndent("", "  ")
++	enc.SetEscapeHTML(false)
++	return enc.Encode(value)
++}
++
++// loadCoreSet resolves the repository, rules and template, then loads the
++// change set with the review's own selection.
++func loadCoreSet(opts coreOptions) (*commonContext, *agent.CoreDiffSet, error) {
++	if err := validateDiffMode(opts.from, opts.to, opts.commit); err != nil {
++		return nil, nil, err
++	}
++	contentRef, _ := tool.ParseReviewMode(opts.from, opts.to, opts.commit).RefValue(opts.to, opts.commit)
++	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, contentRef, 0, opts.maxGitProcs, true)
++	if err != nil {
++		return nil, nil, err
++	}
++	applyCLIExcludes(cc, splitPaths(opts.excludes))
++	if opts.maxTokens > 0 {
++		cc.Template.MaxTokens = opts.maxTokens
++	}
++	if err := validateReviewRefs(cc.RepoDir, reviewOptions{from: opts.from, to: opts.to, commit: opts.commit}); err != nil {
++		return nil, nil, err
++	}
++	set, err := agent.CoreDiffs(context.Background(), coreAgentArgs(cc, opts))
++	if err != nil {
++		return nil, nil, err
++	}
++	return cc, set, nil
++}
++
++func coreAgentArgs(cc *commonContext, opts coreOptions) agent.Args {
++	return agent.Args{
++		RepoDir:    cc.RepoDir,
++		From:       opts.from,
++		To:         opts.to,
++		Commit:     opts.commit,
++		Template:   *cc.Template,
++		SystemRule: cc.Resolver,
++		FileFilter: cc.FileFilter,
++		GitRunner:  cc.GitRunner,
++		Background: opts.background,
++	}
++}
++
++func coreMode(opts coreOptions) string {
++	switch {
++	case opts.commit != "":
++		return "commit"
++	case opts.from != "" && opts.to != "":
++		return "range"
++	default:
++		return "workspace"
++	}
++}
++
++type coreHunkLine struct {
++	Type    string `json:"type"`
++	Content string `json:"content"`
++}
++
++type coreHunk struct {
++	OldStart int            `json:"old_start"`
++	OldCount int            `json:"old_count"`
++	NewStart int            `json:"new_start"`
++	NewCount int            `json:"new_count"`
++	Lines    []coreHunkLine `json:"lines"`
++}
++
++type coreDiffFile struct {
++	Path           string     `json:"path"`
++	OldPath        string     `json:"old_path,omitempty"`
++	Status         string     `json:"status"`
++	Insertions     int64      `json:"insertions"`
++	Deletions      int64      `json:"deletions"`
++	ChangedLines   int64      `json:"changed_lines"`
++	WillReview     bool       `json:"will_review"`
++	ExcludeReason  string     `json:"exclude_reason,omitempty"`
++	Diff           string     `json:"diff,omitempty"`
++	NewFileContent *string    `json:"new_file_content,omitempty"`
++	Hunks          []coreHunk `json:"hunks,omitempty"`
++}
++
++type coreDiffOutput struct {
++	Mode            string         `json:"mode"`
++	From            string         `json:"from,omitempty"`
++	To              string         `json:"to,omitempty"`
++	Commit          string         `json:"commit,omitempty"`
++	MergeBase       string         `json:"merge_base,omitempty"`
++	TotalFiles      int            `json:"total_files"`
++	ReviewableCount int            `json:"reviewable_count"`
++	ExcludedCount   int            `json:"excluded_count"`
++	TotalInsertions int64          `json:"total_insertions"`
++	TotalDeletions  int64          `json:"total_deletions"`
++	Files           []coreDiffFile `json:"files"`
++}
++
++// coreExcludeReason keeps the reason spelling earlier core consumers parse.
++// The review calls an oversized diff "too_large"; core has always said
++// "large_diff". Every other reason passes through unchanged.
++func coreExcludeReason(r agent.ExcludeReason) string {
++	if r == agent.ExcludeTooLarge {
++		return "large_diff"
++	}
++	return string(r)
++}
++
++func coreHunks(raw string) []coreHunk {
++	parsed := diff.ParseHunks(raw)
++	out := make([]coreHunk, 0, len(parsed))
++	for _, h := range parsed {
++		lines := make([]coreHunkLine, 0, len(h.Lines))
++		for _, l := range h.Lines {
++			t := "context"
++			switch l.Type {
++			case diff.HunkAdded:
++				t = "added"
++			case diff.HunkDeleted:
++				t = "deleted"
++			}
++			lines = append(lines, coreHunkLine{Type: t, Content: l.Content})
++		}
++		out = append(out, coreHunk{OldStart: h.OldStart, OldCount: h.OldCount, NewStart: h.NewStart, NewCount: h.NewCount, Lines: lines})
++	}
++	return out
++}
++
++func runCoreDiff(opts coreOptions) error {
++	_, set, err := loadCoreSet(opts)
++	if err != nil {
++		return err
++	}
++	out := coreDiffOutput{
++		Mode: coreMode(opts), From: opts.from, To: opts.to, Commit: opts.commit, MergeBase: set.MergeBase,
++		TotalFiles: len(set.Files), TotalInsertions: set.TotalInsertions, TotalDeletions: set.TotalDeletions,
++		Files: make([]coreDiffFile, 0, len(set.Files)),
++	}
++	for _, f := range set.Files {
++		entry := coreDiffFile{
++			Path: f.Path, Status: f.Status,
++			Insertions: f.Diff.Insertions, Deletions: f.Diff.Deletions,
++			ChangedLines: f.Diff.Insertions + f.Diff.Deletions,
++			WillReview:   f.WillReview, ExcludeReason: coreExcludeReason(f.ExcludeReason),
++		}
++		if f.Diff.OldPath != "" && f.Diff.OldPath != "/dev/null" && f.Diff.OldPath != f.Path {
++			entry.OldPath = f.Diff.OldPath
++		}
++		if f.WillReview {
++			out.ReviewableCount++
++			content := f.Diff.NewFileContent
++			entry.Diff = f.Diff.Diff
++			entry.NewFileContent = &content
++			entry.Hunks = coreHunks(f.Diff.Diff)
++		} else {
++			out.ExcludedCount++
++		}
++		out.Files = append(out.Files, entry)
++	}
++	return writeCoreJSON(out)
++}
++
++type coreRelocateInput struct {
++	Diff           string `json:"diff"`
++	NewFileContent string `json:"new_file_content"`
++	Comment        struct {
++		Content      string `json:"content"`
++		ExistingCode string `json:"existing_code"`
++	} `json:"comment"`
++}
++
++type coreRelocateOutput struct {
++	StartLine int  `json:"start_line"`
++	EndLine   int  `json:"end_line"`
++	Matched   bool `json:"matched"`
++}
++
++func runCoreRelocate(in io.Reader) error {
++	var req coreRelocateInput
++	if err := json.NewDecoder(in).Decode(&req); err != nil {
++		return fmt.Errorf("parse stdin JSON: %w", err)
++	}
++	start, end, ok := agent.RelocateExisting(model.Diff{Diff: req.Diff, NewFileContent: req.NewFileContent}, req.Comment.ExistingCode)
++	return writeCoreJSON(coreRelocateOutput{StartLine: start, EndLine: end, Matched: ok})
++}
++
++// decodeCoreComments accepts either a bare comment array or an object with a
++// "comments" array, plus optional "groups" for emit.
++func decodeCoreComments(data []byte) ([]model.LlmComment, []agent.FileGroupInfo, error) {
++	trimmed := strings.TrimSpace(string(data))
++	if strings.HasPrefix(trimmed, "[") {
++		var comments []model.LlmComment
++		if err := json.Unmarshal([]byte(trimmed), &comments); err != nil {
++			return nil, nil, err
++		}
++		return comments, nil, nil
++	}
++	var wrapped struct {
++		Comments []model.LlmComment    `json:"comments"`
++		Groups   []agent.FileGroupInfo `json:"groups"`
++	}
++	if err := json.Unmarshal([]byte(trimmed), &wrapped); err != nil {
++		return nil, nil, err
++	}
++	return wrapped.Comments, wrapped.Groups, nil
++}
++
++func runCoreEmit(in io.Reader) error {
++	data, err := io.ReadAll(in)
++	if err != nil {
++		return fmt.Errorf("read stdin: %w", err)
++	}
++	comments, groups, err := decodeCoreComments(data)
++	if err != nil {
++		return fmt.Errorf("parse stdin JSON: %w", err)
++	}
++	if comments == nil {
++		comments = []model.LlmComment{}
++	}
++	out := jsonOutput{
++		Status:    "success",
++		ToolCalls: newJSONToolCalls(nil, nil),
++		Comments:  comments,
++		Groups:    groups,
++	}
++	if len(comments) == 0 {
++		out.Message = "No comments generated. Looks good to me."
++	}
++	enc := json.NewEncoder(coreOutput)
++	enc.SetIndent("", "  ")
++	return enc.Encode(out)
++}
++
++func runCoreRule(opts coreOptions, path string) error {
++	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, "", 0, 16, false)
++	if err != nil {
++		return err
++	}
++	rule := ""
++	if cc.Resolver != nil {
++		rule = cc.Resolver.Resolve(path)
++	}
++	_, err = fmt.Fprintln(coreOutput, rule)
++	return err
++}
++
++func phaseConversation(tpl *template.Template, phase string) (*template.LlmConversation, error) {
++	switch phase {
++	case "main":
++		return &tpl.MainTask, nil
++	case "plan":
++		return tpl.PlanTask, nil
++	case "filter":
++		return tpl.ReviewFilterTask, nil
++	case "relocation":
++		return tpl.ReLocationTask, nil
++	case "grouping":
++		return tpl.GroupingTask, nil
++	case "memory_compression":
++		return &tpl.MemoryCompressionTask, nil
++	}
++	return nil, fmt.Errorf("unknown prompt phase %q: expected one of %s", phase, strings.Join(corePhases, ", "))
++}
++
++func runCorePrompt(phase string) error {
++	tpl, err := template.LoadDefault()
++	if err != nil {
++		return fmt.Errorf("load default template: %w", err)
++	}
++	conv, err := phaseConversation(tpl, phase)
++	if err != nil {
++		return err
++	}
++	msgs := make([]llm.Message, 0)
++	if conv != nil {
++		for _, m := range conv.Messages {
++			msgs = append(msgs, llm.NewTextMessage(m.Role, m.Content))
++		}
++	}
++	return writeCoreJSON(msgs)
++}
++
++func coreToolDefs(tpl *template.Template, phase string) ([]llm.ToolDef, error) {
++	switch phase {
++	case "main":
++		return loadToolDefs(tpl.MainTask.Tools)
++	case "plan":
++		if tpl.PlanTask == nil {
++			return []llm.ToolDef{}, nil
++		}
++		return loadToolDefs(tpl.PlanTask.ToolReferences)
++	case "filter":
++		return agent.FilterToolDefs(), nil
++	}
++	return nil, fmt.Errorf("unknown tool phase %q: expected one of main, plan, filter", phase)
++}
++
++func runCoreTools(phase string) error {
++	tpl, err := template.LoadDefault()
++	if err != nil {
++		return fmt.Errorf("load default template: %w", err)
++	}
++	defs, err := coreToolDefs(tpl, phase)
++	if err != nil {
++		return err
++	}
++	return writeCoreJSON(defs)
++}
++
++type coreTemplateOutput struct {
++	Effort                      string   `json:"effort"`
++	MaxTokens                   int      `json:"max_tokens"`
++	MaxCompletionTokens         int      `json:"max_completion_tokens"`
++	MaxToolRequestTimes         int      `json:"max_tool_request_times"`
++	PlanModeLineThreshold       int      `json:"plan_mode_line_threshold"`
++	PlanModeGroupLineThreshold  int      `json:"plan_mode_group_line_threshold"`
++	GroupingMinFiles            int      `json:"grouping_min_files"`
++	GroupingBundleLineThreshold int      `json:"grouping_bundle_line_threshold"`
++	MaxReviewRounds             int      `json:"max_review_rounds"`
++	MaxFilesPerGroup            int      `json:"max_files_per_group"`
++	ConfirmedCap                int      `json:"confirmed_cap"`
++	ConfirmedMaxExistingCode    int      `json:"confirmed_max_existing_code"`
++	ConfirmedMaxContent         int      `json:"confirmed_max_content"`
++	SmallChangeSetLabel         string   `json:"small_change_set_label"`
++	MainTaskTools               []string `json:"main_task_tools"`
++	PlanToolReferences          []string `json:"plan_tool_references"`
++	FilterTools                 []string `json:"filter_tools"`
++	PromptPhases                []string `json:"prompt_phases"`
++}
++
++func runCoreTemplate(opts coreOptions) error {
++	tpl, err := template.LoadDefault()
++	if err != nil {
++		return fmt.Errorf("load default template: %w", err)
++	}
++	effort := template.EffortDefault
++	if opts.effort != "" {
++		if effort, err = template.ParseEffort(opts.effort); err != nil {
++			return err
++		}
++	}
++	tpl.ApplyEffort(effort)
++	limits := agent.Limits()
++	out := coreTemplateOutput{
++		Effort:                      string(effort),
++		MaxTokens:                   tpl.MaxTokens,
++		MaxCompletionTokens:         tpl.CompletionTokenLimit(),
++		MaxToolRequestTimes:         tpl.MaxToolRequestTimes,
++		PlanModeLineThreshold:       tpl.PlanModeLineThreshold,
++		PlanModeGroupLineThreshold:  tpl.PlanModeGroupLineThreshold,
++		GroupingMinFiles:            tpl.GroupingMinFiles,
++		GroupingBundleLineThreshold: tpl.GroupingBundleLineThreshold,
++		MaxReviewRounds:             tpl.ReviewRounds(),
++		MaxFilesPerGroup:            limits.MaxFilesPerGroup,
++		ConfirmedCap:                limits.ConfirmedCap,
++		ConfirmedMaxExistingCode:    limits.ConfirmedMaxExistingCode,
++		ConfirmedMaxContent:         limits.ConfirmedMaxContent,
++		SmallChangeSetLabel:         limits.SmallChangeSetLabel,
++		MainTaskTools:               append([]string{}, tpl.MainTask.Tools...),
++		PlanToolReferences:          []string{},
++		PromptPhases:                corePhases,
++	}
++	if tpl.PlanTask != nil {
++		out.PlanToolReferences = append(out.PlanToolReferences, tpl.PlanTask.ToolReferences...)
++	}
++	for _, d := range agent.FilterToolDefs() {
++		out.FilterTools = append(out.FilterTools, d.Function.Name)
++	}
++	return writeCoreJSON(out)
++}
++
++type coreGroupJSON struct {
++	Label          string   `json:"label"`
++	Key            string   `json:"key"`
++	Files          []string `json:"files"`
++	TotalChanged   int64    `json:"total_changed"`
++	MaxFileChanged int64    `json:"max_file_changed"`
++	PlanRequired   bool     `json:"plan_required"`
++}
++
++type coreGroupOutput struct {
++	Strategy    string          `json:"strategy"`
++	NeedsAnswer bool            `json:"needs_answer"`
++	Messages    []llm.Message   `json:"messages,omitempty"`
++	Groups      []coreGroupJSON `json:"groups"`
++}
++
++func runCoreGroup(opts coreOptions) error {
++	cc, set, err := loadCoreSet(opts)
++	if err != nil {
++		return err
++	}
++	response := ""
++	if opts.responseFile != "" {
++		data, err := os.ReadFile(opts.responseFile)
++		if err != nil {
++			return fmt.Errorf("read --response-file: %w", err)
++		}
++		response = string(data)
++	}
++	grouping, err := agent.GroupForCore(set.Selected, *cc.Template, response)
++	if err != nil {
++		return err
++	}
++	out := coreGroupOutput{Strategy: grouping.Strategy.String(), Groups: []coreGroupJSON{}}
++	if len(grouping.Messages) > 0 {
++		out.NeedsAnswer = true
++		out.Messages = grouping.Messages
++	}
++	for _, g := range grouping.Groups {
++		files := make([]string, 0, len(g.Diffs))
++		for _, d := range g.Diffs {
++			files = append(files, d.NewPath)
++		}
++		out.Groups = append(out.Groups, coreGroupJSON{
++			Label: g.Label, Key: g.Key, Files: files,
++			TotalChanged: g.TotalChanged, MaxFileChanged: g.MaxFileChanged, PlanRequired: g.PlanRequired,
++		})
++	}
++	return writeCoreJSON(out)
++}
++
++type coreFilterID struct {
++	ID   string `json:"id"`
++	Path string `json:"path"`
++}
++
++type coreRenderOutput struct {
++	Phase      string         `json:"phase"`
++	GroupKey   string         `json:"group_key"`
++	Files      []string       `json:"files"`
++	Messages   []llm.Message  `json:"messages"`
++	Tools      []llm.ToolDef  `json:"tools,omitempty"`
++	CommentIDs []coreFilterID `json:"comment_ids,omitempty"`
++}
++
++func readCoreCommentsFile(path string) ([]model.LlmComment, error) {
++	if path == "" {
++		return nil, nil
++	}
++	data, err := os.ReadFile(path)
++	if err != nil {
++		return nil, err
++	}
++	comments, _, err := decodeCoreComments(data)
++	return comments, err
++}
++
++// pickCoreGroup returns the selected diffs named by --files, in the order given.
++func pickCoreGroup(selected []model.Diff, files string) ([]model.Diff, error) {
++	want := splitPaths(files)
++	if len(want) == 0 {
++		return nil, fmt.Errorf("--files is required: comma-separated paths of the review group")
++	}
++	byPath := make(map[string]model.Diff, len(selected))
++	for _, d := range selected {
++		byPath[d.NewPath] = d
++	}
++	group := make([]model.Diff, 0, len(want))
++	for _, p := range want {
++		d, ok := byPath[p]
++		if !ok || d.IsDeleted {
++			return nil, fmt.Errorf("%s is not a reviewable file of this change set", p)
++		}
++		group = append(group, d)
++	}
++	return group, nil
++}
++
++func runCoreRender(opts coreOptions, phase string) error {
++	if phase != "main" && phase != "plan" && phase != "filter" {
++		return fmt.Errorf("unknown render phase %q: expected one of main, plan, filter", phase)
++	}
++	cc, set, err := loadCoreSet(opts)
++	if err != nil {
++		return err
++	}
++	group, err := pickCoreGroup(set.Selected, opts.files)
++	if err != nil {
++		return err
++	}
++	r := agent.CoreRender{Args: coreAgentArgs(cc, opts), Retained: set.Retained, Group: group}
++	if opts.date != "" {
++		if r.Now, err = time.ParseInLocation("2006-01-02 15:04", opts.date, time.Local); err != nil {
++			return fmt.Errorf("invalid --date %q: want \"2006-01-02 15:04\"", opts.date)
++		}
++	}
++
++	out := coreRenderOutput{Phase: phase}
++	for _, d := range group {
++		out.Files = append(out.Files, d.NewPath)
++	}
++	out.GroupKey = coreGroupKey(out.Files)
++
++	switch phase {
++	case "plan":
++		if r.Args.PlanToolDefs, err = coreToolDefs(cc.Template, "plan"); err != nil {
++			return err
++		}
++		out.Messages, err = agent.RenderPlanMessages(r)
++	case "main":
++		if opts.planFile != "" {
++			data, readErr := os.ReadFile(opts.planFile)
++			if readErr != nil {
++				return fmt.Errorf("read --plan-file: %w", readErr)
++			}
++			r.Plan = strings.TrimRight(string(data), "\r\n")
++		}
++		if r.Confirmed, err = readCoreCommentsFile(opts.confirmedFile); err != nil {
++			return fmt.Errorf("read --confirmed-file: %w", err)
++		}
++		if out.Tools, err = coreToolDefs(cc.Template, "main"); err != nil {
++			return err
++		}
++		out.Messages, err = agent.RenderMainMessages(r)
++	case "filter":
++		if r.Comments, err = readCoreCommentsFile(opts.commentsFile); err != nil {
++			return fmt.Errorf("read --comments-file: %w", err)
++		}
++		if len(r.Comments) == 0 {
++			return fmt.Errorf("--comments-file must hold at least one candidate comment")
++		}
++		for i, c := range r.Comments {
++			out.CommentIDs = append(out.CommentIDs, coreFilterID{ID: fmt.Sprintf("c-%d", i), Path: c.Path})
++		}
++		out.Tools = agent.FilterToolDefs()
++		out.Messages, err = agent.RenderFilterMessages(r)
++	}
++	if err != nil {
++		return err
++	}
++	return writeCoreJSON(out)
++}
++
++// coreGroupKey matches the review's group key: the single path, or the sorted
++// paths joined by commas.
++func coreGroupKey(paths []string) string {
++	if len(paths) == 1 {
++		return paths[0]
++	}
++	sorted := append([]string(nil), paths...)
++	sort.Strings(sorted)
++	return strings.Join(sorted, ",")
++}
+diff --git a/cmd/opencodereview/core_cmd_test.go b/cmd/opencodereview/core_cmd_test.go
+new file mode 100644
+index 0000000..3e7b9f8
+--- /dev/null
++++ b/cmd/opencodereview/core_cmd_test.go
+@@ -0,0 +1,392 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 alibaba/open-code-review Contributors
++
++package main
++
++import (
++	"bytes"
++	"encoding/json"
++	"io"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++// runCore captures what a core runner writes to coreOutput.
++func runCore(t *testing.T, fn func() error) ([]byte, error) {
++	t.Helper()
++	var buf bytes.Buffer
++	orig := coreOutput
++	coreOutput = &buf
++	defer func() { coreOutput = orig }()
++	err := fn()
++	return buf.Bytes(), err
++}
++
++func decodeCore[T any](t *testing.T, data []byte) T {
++	t.Helper()
++	var v T
++	if err := json.Unmarshal(data, &v); err != nil {
++		t.Fatalf("decode core JSON: %v\n%s", err, data)
++	}
++	return v
++}
++
++func gitRun(t *testing.T, dir string, args ...string) {
++	t.Helper()
++	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("git %v: %v: %s", args, err, out)
++	}
++}
++
++func writeRepoFile(t *testing.T, dir, name, content string) {
++	t.Helper()
++	path := filepath.Join(dir, name)
++	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
++		t.Fatalf("mkdir: %v", err)
++	}
++	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
++		t.Fatalf("write %s: %v", name, err)
++	}
++}
++
++// coreRangeRepo builds a repo whose HEAD~1..HEAD range modifies, adds and
++// deletes files, and returns the repo dir.
++func coreRangeRepo(t *testing.T) string {
++	t.Helper()
++	freshOCRHome(t)
++	dir := initTestGitRepo(t)
++	writeRepoFile(t, dir, "calc.go", "package calc\n\nfunc Div(a, b int) int {\n\tif b == 0 {\n\t\treturn 0\n\t}\n\treturn a / b\n}\n")
++	writeRepoFile(t, dir, "old.py", "def old():\n    return 1\n")
++	gitRun(t, dir, "add", ".")
++	gitRun(t, dir, "commit", "-m", "base")
++	writeRepoFile(t, dir, "calc.go", "package calc\n\nfunc Div(a, b int) int {\n\treturn a / b\n}\n\nfunc Mul(a, b int) int {\n\treturn a * b\n}\n")
++	writeRepoFile(t, dir, "new.js", "export function f(x) {\n  return eval(x);\n}\n")
++	gitRun(t, dir, "rm", "-q", "old.py")
++	gitRun(t, dir, "add", ".")
++	gitRun(t, dir, "commit", "-m", "change")
++	return dir
++}
++
++func TestCoreDiffRange(t *testing.T) {
++	dir := coreRangeRepo(t)
++	out, err := runCore(t, func() error {
++		return runCoreDiff(coreOptions{repoDir: dir, from: "HEAD~1", to: "HEAD", maxGitProcs: 4})
++	})
++	if err != nil {
++		t.Fatalf("runCoreDiff: %v", err)
++	}
++	got := decodeCore[coreDiffOutput](t, out)
++	if got.Mode != "range" || got.MergeBase == "" {
++		t.Fatalf("envelope = %+v", got)
++	}
++	byPath := map[string]coreDiffFile{}
++	for _, f := range got.Files {
++		byPath[f.Path] = f
++	}
++	calc := byPath["calc.go"]
++	if !calc.WillReview || calc.NewFileContent == nil || len(calc.Hunks) == 0 || calc.ChangedLines != calc.Insertions+calc.Deletions {
++		t.Fatalf("calc.go = %+v", calc)
++	}
++	types := map[string]bool{}
++	for _, l := range calc.Hunks[0].Lines {
++		types[l.Type] = true
++	}
++	if !types["added"] || !types["deleted"] || !types["context"] {
++		t.Fatalf("hunk line types = %v", types)
++	}
++	old := byPath["old.py"]
++	if old.WillReview || old.ExcludeReason != "deleted" || old.Diff != "" || old.NewFileContent != nil {
++		t.Fatalf("old.py = %+v", old)
++	}
++	if got.ReviewableCount != 2 || got.ExcludedCount != 1 || got.TotalFiles != 3 {
++		t.Fatalf("counts = %d/%d/%d", got.ReviewableCount, got.ExcludedCount, got.TotalFiles)
++	}
++}
++
++func TestCoreDiffAppliesSizeGateAndUserExclude(t *testing.T) {
++	dir := coreRangeRepo(t)
++	writeRepoFile(t, dir, ".opencodereview/rule.json", `{"exclude":["*.js"]}`)
++	out, err := runCore(t, func() error {
++		return runCoreDiff(coreOptions{repoDir: dir, from: "HEAD~1", to: "HEAD", maxTokens: 10, maxGitProcs: 4})
++	})
++	if err != nil {
++		t.Fatalf("runCoreDiff: %v", err)
++	}
++	got := decodeCore[coreDiffOutput](t, out)
++	reasons := map[string]string{}
++	for _, f := range got.Files {
++		reasons[f.Path] = f.ExcludeReason
++	}
++	if reasons["calc.go"] != "large_diff" || reasons["new.js"] != "user_exclude" {
++		t.Fatalf("exclude reasons = %v", reasons)
++	}
++}
++
++func TestCoreDiffRejectsHalfRange(t *testing.T) {
++	if _, err := runCore(t, func() error { return runCoreDiff(coreOptions{from: "main"}) }); err == nil {
++		t.Fatal("expected an error for --from without --to")
++	}
++}
++
++func TestCoreRelocate(t *testing.T) {
++	diffText := "diff --git a/x.go b/x.go\n--- a/x.go\n+++ b/x.go\n@@ -1,2 +1,3 @@\n package x\n+func A() {}\n+func B() {}\n"
++	content := "package x\nfunc A() {}\nfunc B() {}\n"
++	cases := []struct {
++		code    string
++		matched bool
++		start   int
++		end     int
++	}{
++		{"func A() {}\nfunc B() {}", true, 2, 3},
++		{"func B() {}", true, 3, 3},
++		{"missing()", false, 0, 0},
++		{"", false, 0, 0},
++	}
++	for _, tc := range cases {
++		in, _ := json.Marshal(map[string]any{"diff": diffText, "new_file_content": content,
++			"comment": map[string]string{"content": "c", "existing_code": tc.code}})
++		out, err := runCore(t, func() error { return runCoreRelocate(bytes.NewReader(in)) })
++		if err != nil {
++			t.Fatalf("relocate %q: %v", tc.code, err)
++		}
++		got := decodeCore[coreRelocateOutput](t, out)
++		if got.Matched != tc.matched || got.StartLine != tc.start || got.EndLine != tc.end {
++			t.Fatalf("relocate %q = %+v", tc.code, got)
++		}
++	}
++	if _, err := runCore(t, func() error { return runCoreRelocate(strings.NewReader("not json")) }); err == nil ||
++		!strings.Contains(err.Error(), "parse stdin JSON") {
++		t.Fatalf("bad JSON error = %v", err)
++	}
++}
++
++func TestCoreEmit(t *testing.T) {
++	in := `[{"path":"a.go","content":"c","start_line":3,"end_line":4,"severity":"high","category":"bug"}]`
++	out, err := runCore(t, func() error { return runCoreEmit(strings.NewReader(in)) })
++	if err != nil {
++		t.Fatalf("emit: %v", err)
++	}
++	got := decodeCore[map[string]any](t, out)
++	comments := got["comments"].([]any)
++	first := comments[0].(map[string]any)
++	if got["status"] != "success" || first["severity"] != "high" || first["category"] != "bug" {
++		t.Fatalf("emit output = %s", out)
++	}
++
++	out, err = runCore(t, func() error {
++		return runCoreEmit(strings.NewReader(`{"comments":[],"groups":[{"label":"g","files":["a.go"]}]}`))
++	})
++	if err != nil {
++		t.Fatalf("emit wrapped: %v", err)
++	}
++	got = decodeCore[map[string]any](t, out)
++	if got["message"] == nil || len(got["comments"].([]any)) != 0 || got["groups"] == nil {
++		t.Fatalf("wrapped emit output = %s", out)
++	}
++
++	if _, err := runCore(t, func() error { return runCoreEmit(strings.NewReader("{")) }); err == nil {
++		t.Fatal("expected a parse error")
++	}
++	if _, err := runCore(t, func() error { return runCoreEmit(errReader{}) }); err == nil {
++		t.Fatal("expected a read error")
++	}
++}
++
++type errReader struct{}
++
++func (errReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
++
++func TestCoreRule(t *testing.T) {
++	freshOCRHome(t)
++	dir := initTestGitRepo(t)
++	out, err := runCore(t, func() error { return runCoreRule(coreOptions{repoDir: dir}, "pkg/a.go") })
++	if err != nil {
++		t.Fatalf("rule: %v", err)
++	}
++	if !strings.Contains(string(out), "Go") {
++		t.Fatalf("Go rule missing:\n%s", out)
++	}
++}
++
++func TestCorePromptPhases(t *testing.T) {
++	for _, phase := range corePhases {
++		out, err := runCore(t, func() error { return runCorePrompt(phase) })
++		if err != nil {
++			t.Fatalf("prompt %s: %v", phase, err)
++		}
++		msgs := decodeCore[[]map[string]string](t, out)
++		if len(msgs) == 0 || msgs[0]["role"] == "" || msgs[0]["content"] == "" {
++			t.Fatalf("prompt %s = %s", phase, out)
++		}
++	}
++	if _, err := runCore(t, func() error { return runCorePrompt("bogus") }); err == nil {
++		t.Fatal("expected an unknown-phase error")
++	}
++}
++
++func TestCoreTools(t *testing.T) {
++	want := map[string]string{"main": "code_comment", "plan": "file_read", "filter": "report_incorrect_comments"}
++	for phase, name := range want {
++		out, err := runCore(t, func() error { return runCoreTools(phase) })
++		if err != nil {
++			t.Fatalf("tools %s: %v", phase, err)
++		}
++		if !strings.Contains(string(out), `"`+name+`"`) {
++			t.Fatalf("tools %s lacks %s:\n%s", phase, name, out)
++		}
++	}
++	if _, err := runCore(t, func() error { return runCoreTools("bogus") }); err == nil {
++		t.Fatal("expected an unknown-phase error")
++	}
++}
++
++func TestCoreTemplate(t *testing.T) {
++	out, err := runCore(t, func() error { return runCoreTemplate(coreOptions{}) })
++	if err != nil {
++		t.Fatalf("template: %v", err)
++	}
++	got := decodeCore[coreTemplateOutput](t, out)
++	if got.Effort != "medium" || got.MaxReviewRounds < 1 || got.MaxFilesPerGroup == 0 || got.ConfirmedCap == 0 ||
++		len(got.FilterTools) == 0 || len(got.MainTaskTools) == 0 {
++		t.Fatalf("template = %+v", got)
++	}
++	out, err = runCore(t, func() error { return runCoreTemplate(coreOptions{effort: "high"}) })
++	if err != nil {
++		t.Fatalf("template high: %v", err)
++	}
++	if high := decodeCore[coreTemplateOutput](t, out); high.MaxReviewRounds <= got.MaxReviewRounds {
++		t.Fatalf("high effort rounds = %d, medium = %d", high.MaxReviewRounds, got.MaxReviewRounds)
++	}
++	if _, err := runCore(t, func() error { return runCoreTemplate(coreOptions{effort: "bogus"}) }); err == nil {
++		t.Fatal("expected an invalid-effort error")
++	}
++}
++
++func TestCoreGroupStrategies(t *testing.T) {
++	dir := coreRangeRepo(t)
++	opts := coreOptions{repoDir: dir, from: "HEAD~1", to: "HEAD", maxGitProcs: 4}
++	out, err := runCore(t, func() error { return runCoreGroup(opts) })
++	if err != nil {
++		t.Fatalf("group: %v", err)
++	}
++	got := decodeCore[coreGroupOutput](t, out)
++	if got.Strategy != "bundle_all" || got.NeedsAnswer || len(got.Groups) != 1 || len(got.Groups[0].Files) != 2 {
++		t.Fatalf("small range grouping = %+v", got)
++	}
++
++	for _, n := range []string{"a", "b", "c", "d", "e"} {
++		writeRepoFile(t, dir, n+".go", "package p\n\nfunc "+strings.ToUpper(n)+"() int { return 1 }\n")
++	}
++	gitRun(t, dir, "add", ".")
++	gitRun(t, dir, "commit", "-m", "five")
++	opts.from = "HEAD~1"
++	out, err = runCore(t, func() error { return runCoreGroup(opts) })
++	if err != nil {
++		t.Fatalf("group llm: %v", err)
++	}
++	got = decodeCore[coreGroupOutput](t, out)
++	if got.Strategy != "llm" || !got.NeedsAnswer || len(got.Messages) == 0 || len(got.Groups) != 0 {
++		t.Fatalf("llm grouping prompt = %+v", got)
++	}
++
++	resp := filepath.Join(t.TempDir(), "resp.txt")
++	writeRepoFile(t, filepath.Dir(resp), "resp.txt", "```json\n[{\"label\":\"ab\",\"files\":[0,1]}]\n```")
++	opts.responseFile = resp
++	out, err = runCore(t, func() error { return runCoreGroup(opts) })
++	if err != nil {
++		t.Fatalf("group answer: %v", err)
++	}
++	got = decodeCore[coreGroupOutput](t, out)
++	if got.NeedsAnswer || len(got.Groups) != 4 || got.Groups[0].Key != "a.go,b.go" {
++		t.Fatalf("answered grouping = %+v", got)
++	}
++
++	opts.responseFile = filepath.Join(t.TempDir(), "missing")
++	if _, err := runCore(t, func() error { return runCoreGroup(opts) }); err == nil {
++		t.Fatal("expected a missing response file error")
++	}
++}
++
++func TestCoreRenderPhases(t *testing.T) {
++	dir := coreRangeRepo(t)
++	base := coreOptions{repoDir: dir, from: "HEAD~1", to: "HEAD", maxGitProcs: 4, files: "calc.go,new.js", date: "2026-01-02 03:04"}
++	tmp := t.TempDir()
++
++	out, err := runCore(t, func() error { return runCoreRender(base, "plan") })
++	if err != nil {
++		t.Fatalf("render plan: %v", err)
++	}
++	plan := decodeCore[coreRenderOutput](t, out)
++	if plan.GroupKey != "calc.go,new.js" || strings.Contains(string(out), "{{") {
++		t.Fatalf("plan render = %s", out)
++	}
++
++	planFile := filepath.Join(tmp, "plan.txt")
++	writeRepoFile(t, tmp, "plan.txt", "PLAN-TEXT\n")
++	confFile := filepath.Join(tmp, "conf.json")
++	writeRepoFile(t, tmp, "conf.json", `[{"path":"new.js","content":"eval is unsafe","existing_code":"return eval(x);"}]`)
++	main := base
++	main.planFile, main.confirmedFile = planFile, confFile
++	out, err = runCore(t, func() error { return runCoreRender(main, "main") })
++	if err != nil {
++		t.Fatalf("render main: %v", err)
++	}
++	text := string(out)
++	for _, want := range []string{"PLAN-TEXT", "confirmed_findings", "2026-01-02 03:04", "old.py", "code_comment"} {
++		if !strings.Contains(text, want) {
++			t.Fatalf("main render lacks %q:\n%s", want, text)
++		}
++	}
++	if strings.Contains(text, "{{") {
++		t.Fatalf("main render left a placeholder:\n%s", text)
++	}
++
++	filter := base
++	filter.commentsFile = confFile
++	out, err = runCore(t, func() error { return runCoreRender(filter, "filter") })
++	if err != nil {
++		t.Fatalf("render filter: %v", err)
++	}
++	f := decodeCore[coreRenderOutput](t, out)
++	if len(f.CommentIDs) != 1 || f.CommentIDs[0].ID != "c-0" || len(f.Tools) == 0 {
++		t.Fatalf("filter render = %+v", f)
++	}
++
++	bad := []coreOptions{
++		{repoDir: dir, from: "HEAD~1", to: "HEAD"},
++		{repoDir: dir, from: "HEAD~1", to: "HEAD", files: "old.py"},
++		{repoDir: dir, from: "HEAD~1", to: "HEAD", files: "calc.go", date: "yesterday"},
++		{repoDir: dir, from: "HEAD~1", to: "HEAD", files: "calc.go", planFile: filepath.Join(tmp, "none")},
++		{repoDir: dir, from: "HEAD~1", to: "HEAD", files: "calc.go", confirmedFile: filepath.Join(tmp, "none")},
++	}
++	for i, o := range bad {
++		if _, err := runCore(t, func() error { return runCoreRender(o, "main") }); err == nil {
++			t.Fatalf("bad render %d: expected an error", i)
++		}
++	}
++	if _, err := runCore(t, func() error { return runCoreRender(base, "filter") }); err == nil {
++		t.Fatal("filter without comments must fail")
++	}
++	if _, err := runCore(t, func() error { return runCoreRender(base, "bogus") }); err == nil {
++		t.Fatal("unknown phase must fail")
++	}
++}
++
++func TestCoreHelpers(t *testing.T) {
++	if got := coreGroupKey([]string{"b.go", "a.go"}); got != "a.go,b.go" {
++		t.Fatalf("coreGroupKey = %q", got)
++	}
++	if got := coreGroupKey([]string{"z.go"}); got != "z.go" {
++		t.Fatalf("coreGroupKey single = %q", got)
++	}
++	if coreMode(coreOptions{commit: "x"}) != "commit" || coreMode(coreOptions{}) != "workspace" {
++		t.Fatal("coreMode")
++	}
++	if coreOptsFor(coreRenderCmd) != &coreRenderOpts || coreOptsFor(coreGroupCmd) != &coreGroupOpts || coreOptsFor(coreDiffCmd) != &coreDiffOpts {
++		t.Fatal("coreOptsFor")
++	}
++}
+diff --git a/cmd/opencodereview/root.go b/cmd/opencodereview/root.go
+index 238bec9..fd5280f 100644
+--- a/cmd/opencodereview/root.go
++++ b/cmd/opencodereview/root.go
+@@ -57,6 +57,7 @@ func init() {
+ 	rootCmd.AddCommand(reviewCmd)
+ 	rootCmd.AddCommand(scanCmd)
+ 	rootCmd.AddCommand(delegateCmd)
++	rootCmd.AddCommand(coreCmd)
+ 	rootCmd.AddCommand(sessionCmd)
+ 	rootCmd.AddCommand(configCmd)
+ 	rootCmd.AddCommand(authCmd)
+@@ -72,7 +73,7 @@ func commandNeedsGit(cmd *cobra.Command) bool {
+ 		topLevel = topLevel.Parent()
+ 	}
+ 	switch topLevel.Name() {
+-	case "review", "scan", "delegate":
++	case "review", "scan", "delegate", "core":
+ 		return true
+ 	default:
+ 		return false
+diff --git a/internal/agent/core.go b/internal/agent/core.go
+new file mode 100644
+index 0000000..24d7f4a
+--- /dev/null
++++ b/internal/agent/core.go
+@@ -0,0 +1,276 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 alibaba/open-code-review Contributors
++
++package agent
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"time"
++
++	"github.com/alibaba/open-code-review/internal/config/template"
++	"github.com/alibaba/open-code-review/internal/diff"
++	"github.com/alibaba/open-code-review/internal/llm"
++	"github.com/alibaba/open-code-review/internal/llmloop"
++	"github.com/alibaba/open-code-review/internal/model"
++)
++
++// The helpers in this file back the `ocr core` command group: the review
++// pipeline's deterministic steps exposed one by one so an external brain can
++// drive the review while reaching the same selection, grouping, prompt and
++// filter inputs as `ocr review`. None of them calls an LLM, and none of them
++// writes progress output, because their callers print JSON on stdout.
++
++// CoreFile is one changed file together with the selection verdict the review
++// itself would reach for it.
++type CoreFile struct {
++	Diff          model.Diff
++	Path          string
++	Status        string
++	WillReview    bool
++	ExcludeReason ExcludeReason
++}
++
++// CoreDiffSet is the full change set in provider order. Selected holds the
++// files the review dispatches; Retained adds deletions, which never get
++// reviewed but still appear in the change-file list the prompts show.
++type CoreDiffSet struct {
++	Files           []CoreFile
++	Selected        []model.Diff
++	Retained        []model.Diff
++	TotalInsertions int64
++	TotalDeletions  int64
++	MergeBase       string
++}
++
++// CoreDiffs loads the change set and applies the same selection `--preview`
++// and the real run use. args needs RepoDir, the diff refs, GitRunner, Template
++// (MaxTokens drives the size gate) and FileFilter (user include/exclude rules).
++func CoreDiffs(ctx context.Context, args Args) (*CoreDiffSet, error) {
++	a := &Agent{args: args}
++	set, err := a.loadPreviewDiffs(ctx)
++	if err != nil {
++		return nil, fmt.Errorf("load diffs: %w", err)
++	}
++	out := &CoreDiffSet{TotalInsertions: a.totalInsertions, TotalDeletions: a.totalDeletions}
++	decisions := a.selectFiles(a.diffs)
++	next := 0
++	set.ForEachInOrder(func(d model.Diff, providerExcluded bool) {
++		if providerExcluded {
++			out.TotalInsertions += d.Insertions
++			out.TotalDeletions += d.Deletions
++			out.Files = append(out.Files, CoreFile{
++				Diff: d, Path: effectivePath(d), Status: diffStatus(d),
++				ExcludeReason: ExcludeProviderDirectory,
++			})
++			return
++		}
++		dec := decisions[next]
++		next++
++		out.Files = append(out.Files, CoreFile{
++			Diff: dec.Diff, Path: effectivePath(dec.Diff), Status: diffStatus(dec.Diff),
++			WillReview: dec.selected(), ExcludeReason: dec.Reason,
++		})
++		if dec.selected() {
++			out.Selected = append(out.Selected, dec.Diff)
++		}
++		if dec.retained() {
++			out.Retained = append(out.Retained, dec.Diff)
++		}
++	})
++	if args.From != "" && args.To != "" {
++		out.MergeBase = diff.NewProvider(args.RepoDir, args.From, args.To, args.GitRunner).MergeBase(ctx)
++	}
++	return out, nil
++}
++
++// CoreLimits are the pipeline constants that are not template fields.
++type CoreLimits struct {
++	MaxFilesPerGroup         int
++	ConfirmedCap             int
++	ConfirmedMaxExistingCode int
++	ConfirmedMaxContent      int
++	SmallChangeSetLabel      string
++}
++
++// Limits returns the review pipeline's built-in constants.
++func Limits() CoreLimits {
++	return CoreLimits{
++		MaxFilesPerGroup:         maxFilesPerGroup,
++		ConfirmedCap:             confirmedCap,
++		ConfirmedMaxExistingCode: confirmedMaxExistingCode,
++		ConfirmedMaxContent:      confirmedMaxContent,
++		SmallChangeSetLabel:      smallChangeSetLabel,
++	}
++}
++
++// FilterToolDefs returns the tools the review filter phase offers the model.
++func FilterToolDefs() []llm.ToolDef {
++	return append([]llm.ToolDef(nil), filterTools...)
++}
++
++// CoreGroup is one review unit with the churn figures that gate its plan phase.
++type CoreGroup struct {
++	Label          string
++	Key            string
++	Diffs          []model.Diff
++	TotalChanged   int64
++	MaxFileChanged int64
++	PlanRequired   bool
++}
++
++// CoreGrouping is the outcome of the grouping step. When Strategy is
++// GroupingViaLLM and no response was supplied, Groups is empty and Messages
++// holds the grouping prompt the caller must answer.
++type CoreGrouping struct {
++	Strategy template.GroupingStrategy
++	Messages []llm.Message
++	Groups   []CoreGroup
++}
++
++// GroupForCore mirrors the review's grouping step over the selected files.
++// response is the grouping model's raw answer; pass "" to ask for the prompt.
++func GroupForCore(selected []model.Diff, tpl template.Template, response string) (*CoreGrouping, error) {
++	var nonDeleted []model.Diff
++	for _, d := range selected {
++		if !d.IsDeleted {
++			nonDeleted = append(nonDeleted, d)
++		}
++	}
++	tokenLimit := llmloop.PromptTokenLimit(tpl.MaxTokens)
++	totalChanged, _ := diffsChurn(nonDeleted)
++	strategy := template.GroupingPerFile
++	if len(nonDeleted) > 1 {
++		strategy = tpl.GroupingPlan(len(nonDeleted), totalChanged)
++		if strategy == template.GroupingViaLLM && (tpl.GroupingTask == nil || len(tpl.GroupingTask.Messages) == 0) {
++			strategy = template.GroupingPerFile
++		}
++	}
++
++	out := &CoreGrouping{Strategy: strategy}
++	var groups []FileGroup
++	switch strategy {
++	case template.GroupingBundleAll:
++		groups = enforceMaxFilesPerGroup([]FileGroup{{Label: smallChangeSetLabel, Diffs: nonDeleted}})
++		groups = enforceGroupTokenBudget(groups, tokenLimit)
++	case template.GroupingViaLLM:
++		if strings.TrimSpace(response) == "" {
++			fileList := buildFileList(nonDeleted)
++			for _, m := range tpl.GroupingTask.Messages {
++				out.Messages = append(out.Messages,
++					llm.NewTextMessage(m.Role, strings.ReplaceAll(m.Content, "{{file_list}}", fileList)))
++			}
++			return out, nil
++		}
++		parsed, err := parseGroupingResponse(response, nonDeleted)
++		if err != nil {
++			return nil, err
++		}
++		groups = enforceGroupTokenBudget(parsed, tokenLimit)
++	default:
++		groups = toSingleFileGroups(nonDeleted)
++	}
++
++	for _, g := range groups {
++		total, maxFile := diffsChurn(g.Diffs)
++		out.Groups = append(out.Groups, CoreGroup{
++			Label: g.Label, Key: fileGroupKey(g.Diffs), Diffs: g.Diffs,
++			TotalChanged: total, MaxFileChanged: maxFile,
++			PlanRequired: tpl.PlanRequired(len(g.Diffs), total, maxFile),
++		})
++	}
++	return out, nil
++}
++
++// CoreRender carries everything a prompt phase substitutes.
++type CoreRender struct {
++	Args      Args
++	Retained  []model.Diff
++	Group     []model.Diff
++	Now       time.Time
++	Plan      string
++	Confirmed []model.LlmComment
++	Comments  []model.LlmComment
++}
++
++func (r CoreRender) agent() *Agent {
++	now := r.Now
++	if now.IsZero() {
++		now = time.Now()
++	}
++	return &Agent{args: r.Args, diffs: r.Retained, currentDate: now.Format("2006-01-02 15:04")}
++}
++
++// RenderPlanMessages builds the plan phase prompt for a group exactly as the
++// review does.
++func RenderPlanMessages(r CoreRender) ([]llm.Message, error) {
++	pt := r.Args.Template.PlanTask
++	if pt == nil || len(pt.Messages) == 0 {
++		return nil, fmt.Errorf("template has no plan task")
++	}
++	a := r.agent()
++	diffs := buildConcatenatedDiffs(r.Group)
++	changeFiles := a.buildChangeFilesExceptGroup(r.Group)
++	rule := a.resolveGroupSystemRule(r.Group)
++	messages := make([]llm.Message, 0, len(pt.Messages))
++	for _, m := range pt.Messages {
++		content := m.Content
++		content = strings.ReplaceAll(content, "{{current_system_date_time}}", a.currentDate)
++		content = strings.ReplaceAll(content, "{{system_rule}}", rule)
++		content = strings.ReplaceAll(content, "{{change_files}}", changeFiles)
++		content = strings.ReplaceAll(content, "{{diffs}}", diffs)
++		content = strings.ReplaceAll(content, "{{requirement_background}}", a.args.Background)
++		content = strings.ReplaceAll(content, "{{plan_tools}}", formatToolDefs(a.args.PlanToolDefs))
++		messages = append(messages, llm.NewTextMessage(m.Role, content))
++	}
++	return messages, nil
++}
++
++// RenderMainMessages builds one main-review round's prompt for a group. Plan
++// applies only to the first round and Confirmed carries the findings earlier
++// rounds kept, matching executeGroupSubtask.
++func RenderMainMessages(r CoreRender) ([]llm.Message, error) {
++	if len(r.Args.Template.MainTask.Messages) == 0 {
++		return nil, errMainTaskEmpty
++	}
++	a := r.agent()
++	return a.buildMainTaskMessages(
++		a.resolveGroupSystemRule(r.Group),
++		a.buildChangeFilesExceptGroup(r.Group),
++		buildConcatenatedDiffs(r.Group),
++		r.Plan,
++		buildConfirmedCommentsBlock(r.Confirmed),
++	), nil
++}
++
++// RenderFilterMessages builds the review filter prompt for one round's new
++// candidate comments. Candidate i is addressed as "c-i" in the model's answer.
++func RenderFilterMessages(r CoreRender) ([]llm.Message, error) {
++	ft := r.Args.Template.ReviewFilterTask
++	if ft == nil || len(ft.Messages) == 0 {
++		return nil, fmt.Errorf("template has no review filter task")
++	}
++	groupKey := fileGroupKey(r.Group)
++	commentsJSON := buildGroupFilterCommentsJSON(r.Comments)
++	diffs := buildConcatenatedDiffs(r.Group)
++	messages := make([]llm.Message, 0, len(ft.Messages))
++	for _, m := range ft.Messages {
++		content := m.Content
++		content = strings.ReplaceAll(content, "{{path}}", groupKey)
++		content = strings.ReplaceAll(content, "{{diff}}", diffs)
++		content = strings.ReplaceAll(content, "{{comments}}", commentsJSON)
++		messages = append(messages, llm.NewTextMessage(m.Role, content))
++	}
++	return messages, nil
++}
++
++// RelocateExisting resolves a comment's existing_code to new-file lines with
++// the review's deterministic matcher. It never consults a model.
++func RelocateExisting(d model.Diff, existingCode string) (start, end int, matched bool) {
++	cm := model.LlmComment{ExistingCode: existingCode}
++	if !diff.ResolveComment(&cm, &d) {
++		return 0, 0, false
++	}
++	return cm.StartLine, cm.EndLine, true
++}
+diff --git a/internal/agent/core_test.go b/internal/agent/core_test.go
+new file mode 100644
+index 0000000..1452825
+--- /dev/null
++++ b/internal/agent/core_test.go
+@@ -0,0 +1,201 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 alibaba/open-code-review Contributors
++
++package agent
++
++import (
++	"context"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/alibaba/open-code-review/internal/config/template"
++	"github.com/alibaba/open-code-review/internal/gitcmd"
++	"github.com/alibaba/open-code-review/internal/model"
++)
++
++func coreTemplate(t *testing.T) template.Template {
++	t.Helper()
++	tpl, err := template.LoadDefault()
++	if err != nil {
++		t.Fatalf("load template: %v", err)
++	}
++	return *tpl
++}
++
++func coreDiff(path string, lines int) model.Diff {
++	var body strings.Builder
++	body.WriteString("diff --git a/" + path + " b/" + path + "\n--- /dev/null\n+++ b/" + path + "\n")
++	for i := 0; i < lines; i++ {
++		body.WriteString("+line\n")
++	}
++	return model.Diff{OldPath: path, NewPath: path, Diff: body.String(), IsNew: true, Insertions: int64(lines)}
++}
++
++func TestGroupForCoreStrategies(t *testing.T) {
++	tpl := coreTemplate(t)
++	tpl.GroupingMinFiles = 4
++	tpl.GroupingBundleLineThreshold = 200
++
++	one, err := GroupForCore([]model.Diff{coreDiff("a.go", 60)}, tpl, "")
++	if err != nil || one.Strategy != template.GroupingPerFile || len(one.Groups) != 1 || !one.Groups[0].PlanRequired {
++		t.Fatalf("single file = %+v, %v", one, err)
++	}
++
++	deleted := model.Diff{OldPath: "gone.go", NewPath: "gone.go", IsDeleted: true}
++	small, err := GroupForCore([]model.Diff{coreDiff("a.go", 2), coreDiff("b.go", 2), deleted}, tpl, "")
++	if err != nil || small.Strategy != template.GroupingBundleAll || len(small.Groups) != 1 ||
++		small.Groups[0].Label != smallChangeSetLabel || small.Groups[0].Key != "a.go,b.go" {
++		t.Fatalf("small set = %+v, %v", small, err)
++	}
++
++	perFile, err := GroupForCore([]model.Diff{coreDiff("a.go", 150), coreDiff("b.go", 150)}, tpl, "")
++	if err != nil || perFile.Strategy != template.GroupingPerFile || len(perFile.Groups) != 2 {
++		t.Fatalf("per file = %+v, %v", perFile, err)
++	}
++
++	many := []model.Diff{coreDiff("a.go", 1), coreDiff("b.go", 1), coreDiff("c.go", 1), coreDiff("d.go", 1)}
++	ask, err := GroupForCore(many, tpl, "")
++	if err != nil || ask.Strategy != template.GroupingViaLLM || len(ask.Messages) == 0 || len(ask.Groups) != 0 {
++		t.Fatalf("llm prompt = %+v, %v", ask, err)
++	}
++	if !strings.Contains(ask.Messages[len(ask.Messages)-1].ExtractText(), "[3]") {
++		t.Fatal("grouping prompt lacks the indexed file list")
++	}
++
++	answered, err := GroupForCore(many, tpl, `[{"label":"x","files":[0,2]}]`)
++	if err != nil || len(answered.Groups) != 3 || answered.Groups[0].Key != "a.go,c.go" {
++		t.Fatalf("llm answer = %+v, %v", answered, err)
++	}
++	if _, err := GroupForCore(many, tpl, "not json"); err == nil {
++		t.Fatal("expected a parse error")
++	}
++
++	tpl.GroupingTask = nil
++	noTask, err := GroupForCore(many, tpl, "")
++	if err != nil || noTask.Strategy != template.GroupingPerFile || len(noTask.Groups) != 4 {
++		t.Fatalf("no grouping task = %+v, %v", noTask, err)
++	}
++}
++
++func TestRenderForCore(t *testing.T) {
++	tpl := coreTemplate(t)
++	group := []model.Diff{coreDiff("a.go", 3)}
++	retained := append([]model.Diff{coreDiff("other.go", 1)}, group...)
++	r := CoreRender{Args: Args{Template: tpl, Background: "BG"}, Retained: retained, Group: group,
++		Now: time.Date(2026, 1, 2, 3, 4, 0, 0, time.UTC), Plan: "THE-PLAN",
++		Confirmed: []model.LlmComment{{Path: "a.go", Content: "seen"}},
++		Comments:  []model.LlmComment{{Path: "a.go", Content: "candidate"}}}
++
++	main, err := RenderMainMessages(r)
++	if err != nil {
++		t.Fatalf("main: %v", err)
++	}
++	text := main[len(main)-1].ExtractText()
++	for _, want := range []string{"THE-PLAN", "seen", "BG", "2026-01-02 03:04", "other.go"} {
++		if !strings.Contains(text, want) {
++			t.Fatalf("main lacks %q", want)
++		}
++	}
++	if _, err := RenderPlanMessages(r); err != nil {
++		t.Fatalf("plan: %v", err)
++	}
++	filter, err := RenderFilterMessages(r)
++	if err != nil || !strings.Contains(filter[len(filter)-1].ExtractText(), `"c-0"`) {
++		t.Fatalf("filter = %v, %v", filter, err)
++	}
++
++	r.Now = time.Time{}
++	if _, err := RenderMainMessages(r); err != nil {
++		t.Fatalf("main with default clock: %v", err)
++	}
++	empty := r
++	empty.Args.Template = template.Template{}
++	if _, err := RenderMainMessages(empty); err == nil {
++		t.Fatal("expected an empty main task error")
++	}
++	if _, err := RenderPlanMessages(empty); err == nil {
++		t.Fatal("expected a missing plan task error")
++	}
++	if _, err := RenderFilterMessages(empty); err == nil {
++		t.Fatal("expected a missing filter task error")
++	}
++}
++
++func TestCoreSmallHelpers(t *testing.T) {
++	d := model.Diff{Diff: "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1,2 @@\n a\n+b\n", NewFileContent: "a\nb\n"}
++	if s, e, ok := RelocateExisting(d, "b"); !ok || s != 2 || e != 2 {
++		t.Fatalf("relocate = %d,%d,%v", s, e, ok)
++	}
++	if _, _, ok := RelocateExisting(d, "zzz"); ok {
++		t.Fatal("relocate matched missing code")
++	}
++	if l := Limits(); l.MaxFilesPerGroup != maxFilesPerGroup || l.ConfirmedCap != confirmedCap {
++		t.Fatalf("limits = %+v", l)
++	}
++	defs := FilterToolDefs()
++	defs[0].Function.Name = "mutated"
++	if filterTools[0].Function.Name == "mutated" {
++		t.Fatal("FilterToolDefs must return a copy")
++	}
++}
++
++func TestCoreDiffsSelection(t *testing.T) {
++	dir := t.TempDir()
++	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
++	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
++	run := func(args ...string) {
++		t.Helper()
++		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
++		if out, err := cmd.CombinedOutput(); err != nil {
++			t.Fatalf("git %v: %v: %s", args, err, out)
++		}
++	}
++	write := func(name, content string) {
++		t.Helper()
++		p := filepath.Join(dir, name)
++		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++	run("init", "-q")
++	run("config", "user.email", "t@t")
++	run("config", "user.name", "t")
++	write("keep.go", "package k\n")
++	write("drop.go", "package d\n")
++	write("vendor/v.go", "package v\n")
++	run("add", ".")
++	run("commit", "-qm", "base")
++	write("keep.go", "package k\n\nfunc K() {}\n")
++	write("vendor/v.go", "package v\n\nfunc V() {}\n")
++	run("rm", "-q", "drop.go")
++	run("add", ".")
++	run("commit", "-qm", "change")
++
++	set, err := CoreDiffs(context.Background(), Args{RepoDir: dir, From: "HEAD~1", To: "HEAD",
++		Template: coreTemplate(t), GitRunner: gitcmd.New(4)})
++	if err != nil {
++		t.Fatalf("CoreDiffs: %v", err)
++	}
++	reasons := map[string]ExcludeReason{}
++	for _, f := range set.Files {
++		reasons[f.Path] = f.ExcludeReason
++	}
++	if reasons["keep.go"] != ExcludeNone || reasons["drop.go"] != ExcludeDeleted || reasons["vendor/v.go"] != ExcludeProviderDirectory {
++		t.Fatalf("reasons = %v", reasons)
++	}
++	if len(set.Selected) != 1 || len(set.Retained) != 2 || set.MergeBase == "" {
++		t.Fatalf("selected=%d retained=%d mergeBase=%q", len(set.Selected), len(set.Retained), set.MergeBase)
++	}
++
++	if _, err := CoreDiffs(context.Background(), Args{RepoDir: filepath.Join(dir, "missing"),
++		Template: coreTemplate(t), GitRunner: gitcmd.New(1)}); err == nil {
++		t.Fatal("expected a load error for a missing repo")
++	}
++}

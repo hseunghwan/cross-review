@@ -1,0 +1,5 @@
+# ocr/build.sh가 읽는 업스트림 기준점. 패치는 이 태그 위에 순서대로 적용된다.
+repo=https://github.com/alibaba/open-code-review.git
+tag=v1.13.8
+commit=4236c871fe8130aa840a2a1c0922f469e87e0416
+version_suffix=+core+claude-oauth
