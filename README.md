@@ -1,7 +1,7 @@
 # cross-review
 
-**서로 다른 두 코드리뷰 엔진**을 같은 로컬 변경에 각각 돌리고, 결과를 병합해
-**"두 엔진이 함께 지적한 항목(고신뢰)"** 과 **"한쪽만 지적한 항목(상대 엔진의 사각지대)"** 으로
+**서로 다른 코드리뷰 엔진 여러 개(2~3개)**를 같은 로컬 변경에 각각 돌리고, 결과를 병합해
+**"여러 엔진이 함께 지적한 항목(고신뢰)"** 과 **"한쪽만 지적한 항목(다른 엔진의 사각지대)"** 으로
 태깅한 단일 리포트를 내는 Claude Code 스킬 모음. MR 보내기 전 로컬 워킹트리를 교차 검증하는 용도.
 
 별도 LLM API 키 없이 **Claude Code 구독**만으로 동작한다.
@@ -12,6 +12,7 @@
 |---|---|
 | [`cross-review`](skills/cross-review/SKILL.md) (v1) | `ce-code-review` × `open-code-review-local` |
 | [`cross-review-v2`](skills/cross-review-v2/SKILL.md) (v2) | `ce-code-review` × `ocr review`(엔진 모드, `anthropic-oauth`) |
+| [`cross-review-ship`](skills/cross-review-ship/SKILL.md) | v2 + Claude Code 내장 `code-review`(`/ship`의 리뷰 단계) — 3엔진 |
 | [`open-code-review-local`](skills/open-code-review-local/SKILL.md) | v1의 엔진 B. `ocr core`를 도구로 Claude가 ocr v1.13.8 파이프라인을 따라감 |
 
 엔진 B에 쓰는 `ocr`는 업스트림 [alibaba/open-code-review](https://github.com/alibaba/open-code-review)
@@ -42,6 +43,20 @@ v1.13.8에 패치 두 개를 얹은 포크 빌드다([`ocr/`](ocr/), [포크 관
 공통: 임시 인덱스 스냅샷(미추적 파일 포함, 워킹트리·인덱스 불변), ce는 `mode:agent depth:full`,
 리포트는 MR 댓글에 그대로 붙일 수 있는 블록 형식.
 
+## cross-review-ship: ship 리뷰 엔진 추가
+
+`cross-review-ship`은 v2의 두 엔진에 **엔진 C**로 Claude Code 내장 `code-review` 스킬을 더한다.
+`/ship`이 PR 리뷰 단계에서 쓰는 엔진과 같다(내장 별칭 `ship:review`). `/ship` 자체는 커밋·push·
+PR 생성·감시까지 하므로 부르지 않고 리뷰 단계만 쓴다.
+
+- 엔진 C는 `BASE...WT` 스냅샷 범위를 타깃으로 받아 엔진 B와 같은 범위(미추적 파일 포함)를 본다.
+- CLI에서 fork 컨텍스트(대화 기록 없는 격리 서브에이전트)로 돌아 작업 세션 맥락에 오염되지 않는다.
+- 병합은 2자 비교 대신 **클러스터링**이다. 결과 구역: ★★ 세 엔진 합의 / ★ 두 엔진 합의(조합 표기) /
+  엔진별 단독 / ce 범위 밖(미추적 파일, ocr·ship만).
+- 추가 설치는 없다. 리뷰 강도는 `level:` 인자로 정한다(생략하면 `/ship`처럼 code-review 기본값).
+
+자세한 결정 근거는 [docs/DESIGN-ship.md](docs/DESIGN-ship.md).
+
 ## 사전 요구사항
 
 - **Claude Code** — Pro/Max/Team 구독으로 로그인(`claude auth status --json`의 `authMethod`가 `claude.ai`).
@@ -55,13 +70,13 @@ v1.13.8에 패치 두 개를 얹은 포크 빌드다([`ocr/`](ocr/), [포크 관
 ```bash
 git clone https://github.com/hseunghwan/cross-review.git ~/src/cross-review
 cd ~/src/cross-review
-./install.sh --with-ocr      # 스킬 3개 링크 + ocr 빌드·설치(기존 ~/.local/bin/ocr 은 백업)
+./install.sh --with-ocr      # 스킬 4개 링크 + ocr 빌드·설치(기존 ~/.local/bin/ocr 은 백업)
 
 # v2 1회 설정: 기본 프로바이더는 그대로 두고 anthropic-oauth 섹션만 추가
 ocr config set providers.anthropic-oauth.model sonnet   # 또는 opus
 ```
 
-Claude Code에서 `/reload-skills` 후 `/cross-review`, `/cross-review-v2`가 보이면 완료.
+Claude Code에서 `/reload-skills` 후 `/cross-review`, `/cross-review-v2`, `/cross-review-ship`이 보이면 완료.
 `install.sh`는 같은 이름의 기존 스킬을 `~/.claude/skills/.trash/`로 옮겨 백업한다.
 
 ## 사용법
@@ -73,7 +88,9 @@ Claude Code에서 `/reload-skills` 후 `/cross-review`, `/cross-review-v2`가 �
 /cross-review-v2           # v2
 /cross-review-v2 base:dev  # diff base 명시 (v1도 같음)
 /cross-review-v2 model:opus  # v2 엔진 B 모델 지정
-/cross-review fix          # 리포트 후, 수정 범위를 상의해 적용 (v2도 같음)
+/cross-review-ship            # ce × ocr × ship 리뷰(code-review)
+/cross-review-ship level:high # 엔진 C 리뷰 강도 지정 (low|medium|high|xhigh|max)
+/cross-review fix          # 리포트 후, 수정 범위를 상의해 적용 (v2·ship도 같음)
 ```
 
 로컬 워킹트리 전용이다. PR을 교차 검증하려면 먼저 `glab mr checkout <id>`(또는
@@ -86,9 +103,12 @@ Step 1  스코프 산정   base 확정 + 임시 인덱스로 워킹트리 스냅
 Step 2  엔진 실행     A: ce-code-review mode:agent depth:full base:BASE
                      B: v1 open-code-review-local (ocr core, REVIEW_FILTER on)
                         v2 ocr review --from BASE --to WT --provider anthropic-oauth (백그라운드, A와 병렬)
+                     C: (ship만) code-review [level] BASE...WT  (/ship의 리뷰 엔진, fork 컨텍스트)
 Step 3  정규화        공통 스키마(P0~P3) — ocr critical/high/medium/low → P0/P1/P2/P3
+                     (ship) important/pre_existing/nit → P1/P2/P3
 Step 4  adjudicator   신선 격리 서브에이전트가 병합·합의 판정(미추적 파일 지적은 제외)
 Step 5  리포트        ★합의 / ce 단독 / ocr 단독 / ce 범위 밖(미추적) 한국어 리포트
+                     (ship) ★★3엔진 / ★2엔진 / 엔진별 단독 / ce 범위 밖(ocr·ship)
 ```
 
 한 엔진이 실패해도 중단하지 않고 나머지 엔진 결과로 리포트한다.
@@ -100,6 +120,8 @@ Step 5  리포트        ★합의 / ce 단독 / ocr 단독 / ce 범위 밖(미�
 - **사용량:** v2 엔진 B는 LLM 호출마다 `claude -p`를 띄운다(호출당 수 초). 스킬은 `--concurrency 2`를
   쓰고, ce와 병렬로 돌아 사용량이 한꺼번에 몰린다. 큰 diff는 나눠서 리뷰하는 편이 안전하다.
   참고 측정: 4개 파일 +38줄에 23초, 약 58k 토큰(sonnet).
+- **cross-review-ship 사용량:** 엔진 C(code-review)도 finder 서브에이전트를 여러 개 띄운다(레벨이 높을수록 많다).
+  ce `depth:full`과 합치면 v2보다 확실히 무겁다. `level:max`는 직접 입력할 때만 쓴다.
 - **이용 정책:** 공식 Claude Code CLI를 본인 로컬에서 대화형으로 쓰는 용도를 전제로 한다.
   CI 같은 무인 실행이나 여러 사람이 함께 쓰는 서비스로 돌리기 전에는 Anthropic 이용 정책을 확인한다.
 - **데이터:** 리뷰를 위해 소스와 diff가 Claude Code 구독 경로로 전송된다. 기밀 코드는 조직 정책을 먼저 확인한다.
@@ -113,6 +135,7 @@ cross-review/
 ├── skills/
 │   ├── cross-review/          v1
 │   ├── cross-review-v2/       v2
+│   ├── cross-review-ship/     ce × ocr × ship 리뷰
 │   └── open-code-review-local/
 ├── ocr/
 │   ├── UPSTREAM               업스트림 기준 태그·커밋
@@ -120,7 +143,7 @@ cross-review/
 │   └── build.sh               업스트림 클론 → 패치 적용 → 빌드 → 설치
 └── docs/
     ├── DESIGN-v1.md, PLAN-v1.md
-    ├── DESIGN-v2.md
+    ├── DESIGN-v2.md, DESIGN-ship.md
     └── ocr-fork.md            포크 배경, 업스트림 버전 올리기, 패치 고치기
 ```
 
