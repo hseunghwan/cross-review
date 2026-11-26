@@ -24,17 +24,14 @@ description: >
 
 ## 사전 점검
 
-```bash
-command -v ocr >/dev/null || echo "ocr 없음"
-ocr llm providers 2>/dev/null | grep '^ *anthropic-oauth ' >/dev/null || echo "anthropic-oauth 프로바이더 없음(통합 바이너리 필요)"
-claude auth status --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("loggedIn") and d.get("authMethod")=="claude.ai" else 1)' \
-  || echo "Claude 구독 로그인 아님(authMethod != claude.ai)"
-```
+- `ocr`가 PATH에 있어야 한다.
+- `ocr llm providers`에 `anthropic-oauth`가 있어야 한다(통합 바이너리 필요).
+- `claude auth status --json`이 `loggedIn: true`와 `authMethod: claude.ai`를 반환해야 한다.
 
 - 셋 중 하나라도 실패하면 **엔진 B를 건너뛴다**(에러 격리 규칙의 ⚠ 배너 + `✗` 상태라인).
-- `ce-code-review` 스킬이 없으면 엔진 A를 건너뛴다.
-- 엔진 C는 내장 스킬이라 별도 설치가 없다. Skill 호출이 실패하면(예: 프로젝트 설정의
-  `disableBundledSkills`) 그때 엔진 C 실패로 기록한다.
+- 엔진 A는 호출 호스트의 CLI(`claude` 또는 `codex`)에 `ce-code-review` 스킬이 설치되어 있어야 한다.
+- 엔진 C는 두 호스트 모두 `claude` CLI의 내장 `code-review`를 쓴다. CLI나 내장 스킬을
+  사용할 수 없으면 엔진 C 실패로 기록한다.
 - 세 엔진이 모두 없으면 종료.
 - `ocr` 설정에 `providers.anthropic-oauth` 섹션이 있어야 한다(README의 1회 설정). 없으면
   `ocr review`가 `provider "anthropic-oauth" is not configured`로 즉시 실패하므로, 그 메시지를
@@ -46,14 +43,17 @@ claude auth status --json 2>/dev/null | python3 -c 'import json,sys; d=json.load
 | 토큰 | 효과 | 기본 |
 |------|------|------|
 | `base:<ref>` | diff base 명시(세 엔진에 동일 주입) | 자동 감지 |
-| `model:<alias>` | 엔진 B 모델(`sonnet`, `opus` 등) → `--model` | 설정값 |
-| `level:<low\|medium\|high\|xhigh\|max>` | 엔진 C 리뷰 강도 → `code-review`의 첫 인자 | 생략(아래 참고) |
+| `model:<alias>` | 이번 실행의 엔진 B 모델 → `--ocr-model` | 엔진 B 설정값 |
+| `level:<low\|medium\|high\|xhigh\|max>` | 이번 실행의 엔진 C effort → `--ship-level` | 엔진 C 설정값 |
 | `fix` | 리포트 후 수정 범위를 사용자와 상의해 적용 | 리포트만 |
 
-- `level:`을 생략하면 레벨 인자 없이 호출한다. 이때 `code-review`는 사용자가 마지막으로 입력한
-  레벨, 없으면 세션 effort를 쓴다(`/ship`을 레벨 없이 부를 때와 같은 동작).
-- `level:max`는 사용자가 **직접 입력했을 때만** 넘긴다. 이 스킬이 스스로 max를 고르지 않는다
-  (가장 비싼 레벨이라 리뷰어 서브에이전트를 많이 띄운다). `ultra`(클라우드 리뷰)는 받지 않는다.
+- 스킬과 함께 설치된 `run_engine.py`를 Python 3으로 호출한다(Windows에서 `py -3` 사용 가능).
+  호출 중인 호스트를 `HOST`로 기록한다. Claude Code에서는 `claude`, Codex에서는 `codex`다.
+  대상 저장소에서 `run_engine.py resolve --host <HOST>`로 설정을 확인한다. 설정 오류는 리뷰 전에 보고한다.
+- 저장소 루트의 `.cross-review-ship.json`, 사용자 홈의 동명 파일 순서로 첫 파일을 읽는다.
+  생략한 엔진은 기본값을 쓴다. 기본 모델은 Claude 계열 엔진에 `claude-sonnet-5-5`,
+  Codex에서 실행하는 엔진 A에 `gpt-6-luna`다. effort는 모두 `medium`이다.
+- `max`는 인자 또는 설정에서 명시한 경우에만 사용한다. `ultra`(클라우드 리뷰)는 받지 않는다.
 - 인식한 토큰은 제거하고 나머지는 무시한다(로컬 전용이라 PR/브랜치 타깃은 받지 않음).
   PR을 교차 검증하려면 "먼저 `glab mr checkout <id>`(또는 `gh pr checkout`)로 체크아웃한 뒤
   `/cross-review-ship` 실행"을 안내한다.
@@ -64,27 +64,10 @@ claude auth status --json 2>/dev/null | python3 -c 'import json,sys; d=json.load
 **임시 인덱스**로 워킹트리 전체(추적 파일의 staged+unstaged + `.gitignore`를 존중한
 미추적 파일)를 스냅샷 커밋 `WT`로 만든다. 실제 워킹트리와 인덱스는 바뀌지 않는다.
 
-```bash
-BASE_REF="${BASE_ARG:-$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/@@')}"
-BASE_REF="${BASE_REF:-origin/HEAD}"
-BASE=$(git merge-base HEAD "$BASE_REF" 2>/dev/null) || BASE=$(git rev-parse "$BASE_REF" 2>/dev/null)
-[ -z "$BASE" ] && { echo "FATAL: base 미해결 — base:<ref>로 명시하세요"; exit 1; }
-git ls-files -u | grep -q . && { echo "FATAL: unmerged/충돌 경로를 먼저 해결하세요"; exit 1; }
-TMPIDX=$(mktemp)
-WT=$(export GIT_INDEX_FILE="$TMPIDX"   # $( ) 서브셸 안에서만 유효 → 실제 .git/index 불변
-     git read-tree HEAD && git add -A && TREE=$(git write-tree) \
-     && git commit-tree -p HEAD -m "cross-review-ship snapshot" "$TREE")
-rm -f "$TMPIDX"
-git rev-parse --verify --quiet "$WT^{commit}" >/dev/null 2>&1 || { echo "FATAL: 스냅샷 실패"; exit 1; }
-UNTRACKED=$(git ls-files --others --exclude-standard)
-echo "BASE=$BASE  WT=$WT"; echo "UNTRACKED:"; echo "$UNTRACKED"
-```
+`run_engine.py snapshot --host <HOST>`를 실행한다. `base:`를 받았으면 `--base <ref>`를
+추가한다. JSON 결과의 `base`와 `snapshot`을 각각 `BASE`, `WT`로 기록하고
+`untracked` 배열을 `UNTRACKED`로 보관한다. 스냅샷 커밋은 ref에 연결되지 않아 Git이 나중에 정리한다.
 
-- **셸 변수는 Bash 호출 사이에 유지되지 않는다.** 위 출력에 나온 `BASE`·`WT`·`UNTRACKED`
-  값을 기록해 두고, 이후 단계의 명령(`ocr review`, ce의 `base:`, code-review 타깃)에는 그 값을
-  **직접 치환해서** 넣는다. `BASE`·`WT`는 40자 전체 SHA를 쓴다.
-- `GIT_INDEX_FILE`을 서브셸에서만 바꾸므로 실제 `.git/index`는 그대로다. 스냅샷 커밋은
-  어떤 ref에도 연결되지 않는 dangling 객체라 `git gc`가 나중에 정리한다.
 - **스코프 비대칭(중요):** 엔진 B와 C는 `WT` 스냅샷 범위를 보므로 미추적 파일까지 리뷰한다.
   ce-code-review는 `base:` 모드에서 미추적 파일을 **범위 밖**으로 둔다(staged가 아니면 Coverage에만
   적음). 따라서 `UNTRACKED` 경로에 대한 B·C 지적은 "ce 사각지대"가 아니라 **"ce 범위 밖"**이다.
@@ -93,26 +76,26 @@ echo "BASE=$BASE  WT=$WT"; echo "UNTRACKED:"; echo "$UNTRACKED"
 
 ## Step 2 — 세 엔진 실행
 
-엔진 B는 서브에이전트를 띄우지 않는 **단일 `ocr` 프로세스**다(내부에서 `claude -p`
-자식 프로세스를 동시성만큼 띄움). 그래서 엔진 B는 A·C와 겹쳐 돌린다. A와 C는 둘 다 Skill
-도구로 부르고 각자 서브에이전트를 여럿 띄우므로 **차례로** 돌린다.
+세 엔진은 `run_engine.py`로 실행한다. 아래 명령의 `RUNNER`는 이 스킬에 포함된 스크립트의
+절대 경로다. `PYTHON`은 Python 3 실행 명령이다. 인자와 경로는 현재 셸에서 안전하게 인용한다.
+엔진 B의 `ocr`는 내부에서 `claude -p` 자식 프로세스를 띄운다. A와 C는 각각 별도의
+CLI 세션에서 서브에이전트를 쓰므로 차례로 실행한다.
 
-1. 엔진 B를 **백그라운드 Bash**(`run_in_background: true`)로 먼저 시작한다.
-2. 엔진 A(ce)를 Skill 도구로 실행하고 결과 JSON을 기록한다.
-3. 엔진 C(code-review)를 Skill 도구로 실행하고 결과를 기록한다.
-4. 엔진 B 완료 알림을 기다린다(폴링 금지, 알림이 오면 결과 파일을 읽는다).
+1. 호스트의 백그라운드 명령 실행 도구로 엔진 B를 먼저 시작한다.
+2. 엔진 A를 실행하고 결과 JSON을 기록한다.
+3. 엔진 C를 실행하고 결과를 기록한다.
+4. 호스트의 완료 알림 또는 명령 세션 대기로 엔진 B가 끝나면 결과 파일을 읽는다.
 
 ### Step 2B — 엔진 B: ocr review (anthropic-oauth)
 
 ```bash
-OUT=$(mktemp --suffix=.json)
-ocr review --from "$BASE" --to "$WT" --provider anthropic-oauth ${MODEL:+--model "$MODEL"} \
-  --format json --audience agent --concurrency 2 --output "$OUT"
+# OUT은 호스트의 임시 디렉터리에 잡은 출력 파일 경로
+"$PYTHON" "$RUNNER" ocr --host "$HOST" --base "$BASE" --snapshot "$WT" --output "$OUT"
 echo "exit=$? out=$OUT"
 ```
 
-- `--concurrency 2`: 기본값 8은 `claude -p`를 8개 동시에 띄워 구독 한도를 빨리 소모한다.
-  다른 엔진과 겹쳐 도는 만큼 낮게 둔다. 큰 변경에서 느리면 3까지.
+- `model:` 인자가 있으면 `--ocr-model <MODEL>`을 추가한다. 실행기는 OCR에 `--model`을 넘기고,
+  자식 Claude의 effort는 `CLAUDE_CODE_EFFORT_LEVEL`로 지정한다. OCR 동시성은 2다.
 - `--output`으로 파일에 쓴다(stdout은 백그라운드 출력 버퍼로 가므로 파싱 대상에서 뺀다).
 - 종료 코드: 일부 파일만 실패해도 0(부분 결과 게시). **선택된 항목이 전부 실패할 때만** 0이 아니다.
 - JSON 최상위 `status`: `complete` | `partial` | `failed` | `skipped`
@@ -126,7 +109,10 @@ echo "exit=$? out=$OUT"
 
 ### Step 2A — 엔진 A: ce-code-review (mode:agent depth:full)
 
-Skill 도구로 `ce-code-review`를 **`mode:agent depth:full base:<BASE>`** 로 호출한다(read-only, JSON 반환).
+`run_engine.py ce --host <HOST> --base <BASE>`로 `ce-code-review`에
+**`mode:agent depth:full base:<BASE>`**를 전달한다(검토 전용, JSON 반환).
+Claude는 모델과 effort를 지정한 `claude -p`에서, Codex는 `codex exec`에서 실행한다.
+Codex의 CE 서브에이전트에도 같은 값을 지정하라는 지시를 전달한다.
 
 - **`depth:full` 필수.** ce의 `mode:agent`는 quick-review 단축만 우회하고, 깊이 게이트
   (lite / focused / full)는 그대로 탄다. lite가 선택되면 **호출한 컨텍스트(= 이 메인 대화)
@@ -139,11 +125,12 @@ Skill 도구로 `ce-code-review`를 **`mode:agent depth:full base:<BASE>`** 로 
 
 ### Step 2C — 엔진 C: ship 리뷰 (code-review)
 
-Skill 도구로 `code-review`를 호출한다. 인자는 **`[<level>] <BASE>...<WT>`** 하나의 문자열이다.
+`run_engine.py ship --host <HOST> --base <BASE> --snapshot <WT>`로 실행한다.
+`level:`이 있으면 `--ship-level <LEVEL>`을 추가한다. 실행기는 두 호스트에서 모두
+모델과 effort를 지정한 `claude -p`에 내장 스킬 호출을 전달한다.
 
 ```
-skill: "code-review"
-args:  "<level> <BASE 전체 SHA>...<WT 전체 SHA>"     # level: 인자가 없으면 범위만
+/code-review <effort> <BASE 전체 SHA>...<WT 전체 SHA>
 ```
 
 - **타깃은 반드시 `BASE...WT` 범위 형식**으로 준다. code-review는 `a...b`/`a..b` 범위를 타깃으로
@@ -161,9 +148,9 @@ args:  "<level> <BASE 전체 SHA>...<WT 전체 SHA>"     # level: 인자가 없�
   - 반환이 `[`로 시작하면 JSON 배열(`[{file, line, summary, failure_scenario, severity?}]`)이므로
     그대로 파싱한다.
   - `Code review found no issues.` 또는 `[]` → findings 0(정상).
-  - Skill 호출 오류, 위 두 형식 어느 것으로도 읽히지 않는 응답 → 엔진 C 전체 실패(에러 격리).
+  - CLI 호출 오류, 위 두 형식 어느 것으로도 읽히지 않는 응답 → 엔진 C 전체 실패(에러 격리).
     읽히지 않은 응답 원문 앞부분 200자를 배너 사유에 붙인다.
-- 엔진 상태줄에는 레벨(주어졌으면 그 값, 아니면 "기본")과 findings 수를 쓴다.
+- 엔진 상태줄에는 설정에서 해석한 모델과 effort(호출 인자 우선), findings 수를 쓴다.
 
 ## Step 3 — 정규화
 
@@ -199,7 +186,8 @@ args:  "<level> <BASE 전체 SHA>...<WT 전체 SHA>"     # level: 인자가 없�
 
 ## Step 4 — adjudicator 서브에이전트 (병합 / 합의 판정)
 
-**신선 격리 서브에이전트**를 1개 띄운다(Agent 도구, `subagent_type: general-purpose`).
+**신선 격리 서브에이전트**를 1개 띄운다. Claude Code는 Agent 도구의 `general-purpose`,
+Codex는 `spawn_agent`의 `fork_turns: none`을 쓴다.
 입력은 정규화된 세 리스트(JSON 데이터)와 저장소 루트 절대경로뿐. **작업 세션의 코드 의도나
 광역 컨텍스트를 절대 전달하지 않는다.** 실패한 엔진의 리스트는 빈 배열로 넘기고, 살아 있는
 엔진이 하나뿐이면 adjudicator를 건너뛴다(에러 격리 참고).
@@ -271,7 +259,7 @@ args:  "<level> <BASE 전체 SHA>...<WT 전체 SHA>"     # level: 인자가 없�
 ```
 ## Cross-Review Ship 결과  (base: <BASE 짧은sha>, N개 파일)
 
-**엔진:** ce-code-review ✓ (depth:full) / ocr review (anthropic-oauth) ✓ (<model>, <elapsed>, <total_tokens> tok) / ship 리뷰 (code-review) ✓ (level: <level|기본>)
+**엔진:** ce-code-review ✓ (<model>, <effort>, depth:full) / ocr review ✓ (<model>, <effort>, <elapsed>, <total_tokens> tok) / ship 리뷰 ✓ (<model>, <effort>)
 **3엔진 합의 {n3} · 2엔진 합의 {n2} · ce 단독 {ce} · ocr 단독 {ocr} · ship 단독 {ship} · ce 범위 밖 {out}**
 
 ### ★★ 세 엔진 합의 (최고 신뢰)
@@ -337,7 +325,7 @@ args:  "<level> <BASE 전체 SHA>...<WT 전체 SHA>"     # level: 인자가 없�
 - **엔진 전체 실패 판정:**
   - ce: `status: failed/degraded` 또는 스킬 미설치.
   - ocr: 사전 점검 실패, 0이 아닌 종료 코드, `status: failed`, JSON 파싱 실패. `partial`은 전체 실패가 아니다.
-  - ship: Skill 호출 오류, 반환 형식 파싱 실패.
+  - ship: CLI 호출 오류, 반환 형식 파싱 실패.
 - 일부 엔진이 실패해도 **중단하지 않는다.** 상단에 `⚠ <엔진> 실패(<사유>): 나머지 엔진 결과만 표시`를
   엔진마다 붙이고 상태줄의 해당 엔진을 `✗`로 표시한다.
   - **두 엔진이 살아 있으면** adjudicator를 그대로 돌리되 죽은 엔진 리스트는 빈 배열로 넘긴다.

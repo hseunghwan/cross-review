@@ -13,7 +13,7 @@
 - `/ship`(내부 이름 `ship-local`)에는 별도 리뷰 프롬프트가 없다. 내장 `code-review` 스킬이
   `ship:review` 별칭을 가지며, ship의 리뷰 단계가 이 스킬을 쓴다.
 - `/ship`은 커밋·push·PR 생성·최대 7일 감시까지 하고, 스킬 설명에 "Claude가 직접 부르지 말 것"이
-  명시돼 있다. 로컬 사전 검증 도구로는 맞지 않으므로 이 스킬은 `code-review`만 Skill 도구로 부른다.
+  명시돼 있다. 실행기는 `claude -p`에서 내장 `/code-review`를 호출한다.
 
 ## 2. 호출 계약 (2.1.332 기준)
 
@@ -25,7 +25,7 @@
 | 실행 컨텍스트 | `getContext` → CLI에서는 `fork`(격리 서브에이전트). ReportFindings 렌더링이 켜진 데스크톱/웹 등에서만 `inline` |
 | fork 출력 계약 | `[{file, line, summary, failure_scenario, severity?}]` JSON 배열. 호출자에게는 `formatForegroundForkResult`가 ``N findings …: 1. 🔴 Important `file:line`: summary / Failure scenario: …`` 텍스트로 바꿔 돌려준다. 0건이면 `Code review found no issues.` |
 | severity | 레시피에 따라 `important` / `pre_existing` / `nit` 또는 없음 |
-| 레벨 생략 시 | 사용자가 마지막에 입력한 레벨 → 없으면 세션 effort |
+| 레벨 | 실행기가 Ship의 설정 effort를 리뷰 레벨과 CLI effort에 전달. `level:`이 이번 실행에서 우선 |
 
 - 레벨 레시피(예: high): finder 각도 8개(정확성 3 + 정리 3 + altitude 1 + 컨벤션 1) × 후보 6개 →
   1표 검증(recall 우선) → 상위 N개. 정확성 외 정리성 지적도 섞여 나온다.
@@ -45,8 +45,9 @@
 
 ### 3.3 실행 순서
 - 엔진 B는 OS 프로세스라 백그라운드로 먼저 띄운다.
-- A(ce)와 C(code-review)는 둘 다 Skill 도구로 불리고 각자 서브에이전트를 여럿 띄운다. 메인 대화가
-  두 스킬을 동시에 진행할 수 없으므로 A → C 차례로 돌린다.
+- A(ce)와 C(code-review)는 별도 CLI 세션에서 각자 서브에이전트를 띄운다. A → C 차례로 실행한다.
+- A는 호출 호스트의 CLI를, B와 C는 두 호스트 모두 Claude CLI를 사용한다.
+  모델과 effort의 기본값 및 설정 파일은 [README](../README.md#모델과-effort-고정)를 따른다.
 
 ### 3.4 정규화
 - `important→P1`, `pre_existing→P2`, `nit→P3`, 없음→`P2`. `important`는 P0/P1을 구분하지 않으므로

@@ -2,9 +2,9 @@
 
 **서로 다른 코드리뷰 엔진 여러 개(2~3개)**를 같은 로컬 변경에 각각 돌리고, 결과를 병합해
 **"여러 엔진이 함께 지적한 항목(고신뢰)"** 과 **"한쪽만 지적한 항목(다른 엔진의 사각지대)"** 으로
-태깅한 단일 리포트를 내는 Claude Code 스킬 모음. MR 보내기 전 로컬 워킹트리를 교차 검증하는 용도.
+태깅한 단일 리포트를 내는 스킬 모음. MR 보내기 전 로컬 워킹트리를 교차 검증하는 용도.
 
-별도 LLM API 키 없이 **Claude Code 구독**만으로 동작한다.
+Claude Code 구독으로 동작한다. Codex에서 `cross-review-ship`을 실행하려면 Codex CLI 로그인도 필요하다.
 
 ## 구성
 
@@ -53,7 +53,31 @@ PR 생성·감시까지 하므로 부르지 않고 리뷰 단계만 쓴다.
 - CLI에서 fork 컨텍스트(대화 기록 없는 격리 서브에이전트)로 돌아 작업 세션 맥락에 오염되지 않는다.
 - 병합은 2자 비교 대신 **클러스터링**이다. 결과 구역: ★★ 세 엔진 합의 / ★ 두 엔진 합의(조합 표기) /
   엔진별 단독 / ce 범위 밖(미추적 파일, ocr·ship만).
-- 추가 설치는 없다. 리뷰 강도는 `level:` 인자로 정한다(생략하면 `/ship`처럼 code-review 기본값).
+- Claude Code와 Codex에서 실행할 수 있다. 두 호스트 모두 OCR과 Ship 리뷰에 Claude CLI를 사용한다.
+
+### 모델과 effort 고정
+
+| 실행 호스트 | CE | OCR | Ship |
+|---|---|---|---|
+| Claude Code | `claude-sonnet-5-5` / `medium` | `claude-sonnet-5-5` / `medium` | `claude-sonnet-5-5` / `medium` |
+| Codex | `gpt-6-luna` / `medium` | `claude-sonnet-5-5` / `medium` | `claude-sonnet-5-5` / `medium` |
+
+기본값을 바꾸려면 대상 저장소 루트나 사용자 홈에 `.cross-review-ship.json`을 둔다.
+저장소 파일이 우선한다. 선택된 파일에서 빠진 엔진과 CE 호스트는 기본값을 쓴다.
+
+```json
+{
+  "ce": {
+    "claude": {"model": "claude-sonnet-5-5", "effort": "medium"},
+    "codex": {"model": "gpt-6-luna", "effort": "medium"}
+  },
+  "ocr": {"model": "claude-sonnet-5-5", "effort": "medium"},
+  "ship": {"model": "claude-sonnet-5-5", "effort": "medium"}
+}
+```
+
+한 번만 덮어쓰려면 `model:opus`(OCR) 또는 `level:high`(Ship)를 넘긴다. Ship의 effort는
+Claude 세션 effort와 내장 리뷰 레벨에 함께 전달된다. 모델이 해당 effort를 지원해야 한다.
 
 자세한 결정 근거는 [docs/DESIGN-ship.md](docs/DESIGN-ship.md).
 
@@ -64,6 +88,8 @@ PR 생성·감시까지 하므로 부르지 않고 리뷰 단계만 쓴다.
 - **`ce-code-review` 스킬** — compound-engineering 플러그인. 설치된 버전을 그대로 호출한다.
   없으면 ocr 단독으로 동작(리포트에 명시).
 - 로컬 git 저장소.
+- **`cross-review-ship`** — Python 3, Claude Code 2.1.257 이상. Codex에서 쓸 때는
+  `codex` CLI와 Codex용 `ce-code-review` 스킬도 필요하다.
 
 ## 설치
 
@@ -78,6 +104,8 @@ ocr config set providers.anthropic-oauth.model sonnet   # 또는 opus
 
 Claude Code에서 `/reload-skills` 후 `/cross-review`, `/cross-review-v2`, `/cross-review-ship`이 보이면 완료.
 `install.sh`는 같은 이름의 기존 스킬을 `~/.claude/skills/.trash/`로 옮겨 백업한다.
+Codex에는 `skills/cross-review-ship/` 폴더 전체를 `~/.agents/skills/cross-review-ship/`에
+복사하거나 링크한다. Codex에서 `$cross-review-ship`으로 호출한다.
 
 ## 사용법
 
